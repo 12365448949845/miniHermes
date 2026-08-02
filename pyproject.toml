@@ -1,0 +1,36 @@
+[project]
+name = "minihermes"
+version = "1.1.7"
+description = "MiniHermes - A lightweight AI coding assistant CLI"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.30.0",
+    "rich>=14.0.0",
+    "prompt-toolkit>=3.0.52",
+    "pyyaml>=6.0",
+    "requests>=2.31.0",
+    "psutil>=5.9.0",
+    "beautifulsoup4>=4.12.0",
+    "e2b-code-interpreter",
+    "python-dotenv",
+    "exa-py>=1.0",
+]
+
+[project.scripts]
+minihermes = "minihermes_cli:main"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["minihermes_cli"]
+
+[tool.uv]
+managed = true

@@ -1,0 +1,38 @@
+"""技能系统：发现、加载、索引构建。"""
+from .manager import (
+    build_skills_index,
+    discover_skills,
+    extract_skill_conditions,
+    extract_skill_config_vars,
+    get_external_skills_dirs,
+    iter_skill_index_files,
+    load_skill,
+    load_skill_structured,
+    parse_frontmatter,
+    skill_matches_platform,
+    sync_builtin_skills,
+    USER_SKILLS_DIR,
+    _get_skills_dirs,
+    _parse_frontmatter,
+    EXTERNAL_DIRS,
+    DISABLED_SKILLS,
+)
+
+__all__ = [
+    "build_skills_index",
+    "discover_skills",
+    "extract_skill_conditions",
+    "extract_skill_config_vars",
+    "get_external_skills_dirs",
+    "iter_skill_index_files",
+    "load_skill",
+    "load_skill_structured",
+    "parse_frontmatter",
+    "skill_matches_platform",
+    "sync_builtin_skills",
+    "USER_SKILLS_DIR",
+    "_get_skills_dirs",
+    "_parse_frontmatter",
+    "EXTERNAL_DIRS",
+    "DISABLED_SKILLS",
+]

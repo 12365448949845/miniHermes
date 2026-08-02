@@ -1,0 +1,22 @@
+model:
+  name: "deepseek-v4-pro"
+  base_url: ""
+  api_key: ""
+  max_iterations: 100
+  show_thinking: true
+  reason: true
+
+search:
+  # Exa AI 搜索 API — 专为 AI Agent 设计的搜索引擎
+  # 注册获取免费 API Key（1,000 请求/月）：https://dashboard.exa.ai
+  api_key: ""
+  count: 5
+
+code_execution:
+  # 七牛云 E2B 兼容沙箱 API Key
+  api_key: ""
+
+evolution:
+  # 自动进化系统总开关（记忆复盘 / 技能复盘 / Curator 维护）
+  enabled: true
+
