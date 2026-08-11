@@ -364,7 +364,7 @@ All old APIs preserved: `discover_skills()` returns same shape, `load_skill()` r
 - Tool execution retry is always enabled for `bash`, `web_extract`, `web_search` — up to 2 retries on timeout/transient errors. Bash timeout doubles on each retry (max 120s).
 - All tool outputs go through `truncate_output()` (50K char limit, head 40% + tail 60%).
 - Config merging: user config at `~/.minihermes/config.yaml` is merged over the default template at `config/config.yaml`. A `Config` class provides injectable access with lazy loading. Missing top-level keys are auto-filled on load.
-- The build script (`build_wheel.sh`) copies source modules into `minihermes_cli/app/` before packaging. Only `minihermes_cli/` is included in the wheel. The package list in `build_wheel.sh` must stay in sync with the project structure.
+- Wheel 构建和可编辑安装直接使用顶层源码包；新增顶层包时需要同步更新 `pyproject.toml` 的 Hatch package list。
 - The CLI runs two threads: main thread (prompt_toolkit UI event loop) and daemon thread (conversation loop consuming from `AppState.input_queue`). `AppState` (`cli/state.py`) is the shared mutable state.
 - Primary language in commits and comments is Chinese.
 

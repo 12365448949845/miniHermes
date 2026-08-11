@@ -9,12 +9,7 @@ Nudge agent 在后台 daemon 线程中运行，永不阻塞用户交互。
 """
 
 import logging
-import threading
-from typing import Optional
-
-from agent.agent import Agent
-from provider import Provider
-from renderer import StreamRenderer
+from approval import ApprovalMode
 
 logger = logging.getLogger(__name__)
 
@@ -46,24 +41,18 @@ You are a background skill review agent. Your job is to analyze the conversation
 and identify reusable patterns worth preserving as skills.
 
 Signals that indicate a skill opportunity:
-1. User corrected style/tone/format/workflow → patch or edit the loaded skill, or create new one
+1. User corrected style/tone/format/workflow → propose a patch or a new skill
 2. A non-trivial technique, fix, workaround, or debugging path emerged (5+ tool calls)
-3. A loaded skill turned out wrong, incomplete, or outdated → patch or edit it
+3. A loaded skill turned out wrong, incomplete, or outdated → describe the needed change
 4. A pattern appeared that would clearly recur across projects
 
-Available actions via skill_manage:
-- create: create a new skill with name, description, body
-- edit: full rewrite of an existing skill's body
-- patch: targeted find-and-replace within a skill
-- archive: move unused skill to _archived/
-- restore: bring archived skill back to active
-- list: view all skills with usage stats
-- write_file: add supporting files (references/, templates/, scripts/, assets/)
-- remove_file: delete supporting files
+You may use skill_manage(action=list), skill_view, and read_file to inspect the
+current library. Do not create, edit, patch, archive, restore, or write files.
+Return a concrete proposal for a later reviewed workflow to apply.
 
 Rules:
 - Create CLASS-LEVEL umbrella skills, not narrow one-offs
-- Prefer patching/editing existing skills over creating overlapping new ones
+- Prefer proposing an update to an existing skill over proposing an overlap
 - Check existing skills with 'list' first to avoid duplicates
 - Skills can have supporting files under references/, templates/, scripts/, assets/
 - Include: When to Use, Procedure, Pitfalls, Verification sections
@@ -94,64 +83,88 @@ def _format_messages(messages: list[dict], n: int = 20) -> str:
     return "\n\n".join(lines)
 
 
-def _run_nudge(provider: Provider, prompt: str, tool_filter: dict):
-    """在当前线程中运行 nudge agent（由 daemon thread 调用）。"""
-    try:
-        max_iters = 10  # 后台 agent 安全预算，防止失控
-
-        agent = Agent(
-            provider=provider,
-            db=None,
-            clarify_callback=None,
-            auto_approve=True,
-            tool_filter=tool_filter,
-            system_prompt_override=prompt,
-            max_iterations_override=max_iters,
-        )
-
-        agent.run_conversation(
-            user_message="Review the conversation and take action.",
-            history=[],
-            renderer=None,
-            session_id=None,
-        )
-    except Exception as e:
-        logger.debug(f"Nudge agent error (non-fatal): {e}")
-
-
-def spawn_nudge(
-    provider: Provider,
+def build_nudge_specs(
     conversation_history: list[dict],
     nudge_type: str = "both",
-):
-    """
-    非阻塞：后台线程中运行 nudge agent(s)。
+    *,
+    model: str = "",
+) -> list[tuple[object, dict]]:
+    """构造由 Runtime 提交的低优先级 Nudge 规格，不直接创建 Agent。"""
+    from agent.runtime import AgentSpec
 
-    Args:
-        provider: LLM provider 实例
-        conversation_history: 当前对话历史
-        nudge_type: "memory" | "skill" | "both"
-    """
     text = _format_messages(conversation_history, n=20)
     if not text.strip():
-        return
+        return []
+
+    specs = []
 
     if nudge_type in ("memory", "both"):
         prompt = MEMORY_NUDGE_PROMPT.format(n=20, conversation_text=text)
-        t = threading.Thread(
-            target=_run_nudge,
-            args=(provider, prompt, {"include": {"memory"}}),
-            daemon=True,
-            name="nudge-memory",
-        )
-        t.start()
+        specs.append((
+            AgentSpec(
+                kind="memory_nudge",
+                system_prompt=prompt,
+                tool_policy={"include": {"memory"}},
+                approval_mode=ApprovalMode.DENY_SENSITIVE,
+                max_iterations=10,
+                persist_messages=False,
+                background=True,
+            ),
+            {
+                "task": "Review durable user and environment memories.",
+                "user_message": "Review the conversation and take action.",
+                "model": model,
+            },
+        ))
 
     if nudge_type in ("skill", "both"):
         prompt = SKILL_NUDGE_PROMPT.format(n=20, conversation_text=text)
-        t = threading.Thread(
-            target=_run_nudge,
-            args=(provider, prompt, {"include": {"skill_manage", "skill_view", "read_file", "write_file"}}),
-            daemon=True,
-            name="nudge-skill",
+        specs.append((
+            AgentSpec(
+                kind="skill_nudge",
+                system_prompt=prompt,
+                tool_policy={"include": {"skill_manage", "skill_view", "read_file"}},
+                approval_mode=ApprovalMode.DENY_SENSITIVE,
+                max_iterations=10,
+                persist_messages=False,
+                background=True,
+            ),
+            {
+                "task": "Review reusable skill opportunities.",
+                "user_message": "Review the conversation and return a concrete proposal.",
+                "model": model,
+            },
+        ))
+    return specs
+
+
+def submit_nudge(
+    runtime,
+    conversation_history: list[dict],
+    nudge_type: str = "both",
+    *,
+    conversation_id: str | None = None,
+    session_id: str | None = None,
+    model: str = "",
+    parent_tool_policy=None,
+) -> list:
+    """把 Nudge 登记到 Runtime 单 worker 队列。"""
+    outcomes = []
+    for spec, request in build_nudge_specs(
+        conversation_history, nudge_type, model=model
+    ):
+        outcomes.append(runtime.submit_background(
+            spec=spec,
+            request=request,
+            conversation_id=conversation_id,
+            session_id=session_id,
+            parent_tool_policy=parent_tool_policy,
         )
-        t.start()
+        )
+    return outcomes
+
+
+def spawn_nudge(runtime, conversation_history: list[dict], nudge_type: str = "both",
+                **kwargs):
+    """兼容入口：现在由 Runtime 管理，而非自行创建 daemon 线程。"""
+    return submit_nudge(runtime, conversation_history, nudge_type, **kwargs)

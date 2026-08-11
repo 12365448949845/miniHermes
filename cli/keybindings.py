@@ -173,15 +173,27 @@ def build_keybindings(state: AppState, input_area) -> KeyBindings:
             event.app.invalidate()
             return
         if state.approval_state:
-            state.approval_state["response_queue"].put("deny")
-            state.clear_approval()
+            run_id = state.approval_state.get("run_id")
+            if run_id and state.runtime:
+                state.runtime.cancel(run_id)
+            else:
+                state.approval_state["response_queue"].put("deny")
+                state.clear_approval()
             event.app.invalidate()
             return
         if state.clarify_state:
-            _cancel_clarify(event)
+            run_id = state.clarify_state.get("run_id")
+            if run_id and state.runtime:
+                state.runtime.cancel(run_id)
+                event.app.invalidate()
+            else:
+                _cancel_clarify(event)
             return
         if state.command_running:
-            state.agent.interrupt()
+            if state.runtime and state.conversation_id:
+                state.runtime.interrupt_current(state.conversation_id)
+            else:
+                state.agent.interrupt()
         else:
             if input_area.text:
                 input_area.text = ""

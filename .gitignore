@@ -7,6 +7,7 @@
 
 build/
 dist/
+.uv-cache/
 *.whl
 *.egg-info/
 minihermes_cli/app/

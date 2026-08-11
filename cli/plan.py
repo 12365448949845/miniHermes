@@ -12,15 +12,12 @@ from prompt_toolkit.layout.containers import ConditionalContainer
 from prompt_toolkit.filters import Condition
 
 from cli.state import AppState
+from tools.registry import PLAN_TOOL_LIMIT
 
 
 # ── Plan 模式允许的工具（只读）─────────────────────────────────────────────────
 
-PLAN_ALLOWED_TOOLS = {
-    "read_file", "list_dir", "web_search", "web_extract",
-    "session_search", "process", "memory", "clarify",
-    "todo", "skill_view",
-}
+PLAN_ALLOWED_TOOLS = set(PLAN_TOOL_LIMIT)
 
 # ── Plan 模式系统提示追加 ─────────────────────────────────────────────────────
 

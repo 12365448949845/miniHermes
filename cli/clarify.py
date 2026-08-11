@@ -85,10 +85,11 @@ def build_clarify_widget(state: AppState):
 def make_clarify_callback(state: AppState):
     """工厂函数：生成传给 Agent 的 clarify 回调。"""
 
-    def _clarify_callback(question, choices):
+    def _clarify_callback(question, choices, run_context=None):
         timeout = 120
         response_queue: Queue = Queue()
         normalized_choices = list(choices or [])
+        run_id = getattr(run_context, "run_id", None)
 
         state.clarify_state = {
             "question": question,
@@ -96,15 +97,23 @@ def make_clarify_callback(state: AppState):
             "selected": 0,
             "custom_text": "",
             "response_queue": response_queue,
+            "run_id": run_id,
         }
         state.clarify_freetext = not bool(normalized_choices)
         state.clarify_deadline = time.monotonic() + timeout
         state.invalidate()
 
         while not state.should_exit:
+            if run_context and hasattr(run_context, "raise_if_aborted"):
+                try:
+                    run_context.raise_if_aborted()
+                except Exception:
+                    state.clear_clarify(run_id)
+                    state.invalidate()
+                    raise
             try:
-                response = response_queue.get(timeout=1)
-                state.clear_clarify()
+                response = response_queue.get(timeout=0.1)
+                state.clear_clarify(run_id)
                 state.invalidate()
                 return response
             except Empty:
@@ -112,8 +121,11 @@ def make_clarify_callback(state: AppState):
                     break
                 state.invalidate()
 
-        state.clear_clarify()
+        state.clear_clarify(run_id)
         state.invalidate()
+        if state.should_exit and run_context is not None:
+            from agent.runtime import AgentRunCancelled
+            raise AgentRunCancelled("shutdown", "Clarification wait cancelled during shutdown")
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
         return (
             "The user did not provide a response within the time limit. "

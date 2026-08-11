@@ -1,148 +1,179 @@
-"""安全审批策略引擎。
-
-封装审批规则检查、session 白名单管理、
-以及 allow/block/confirm 三种结果的解析逻辑。
-"""
+"""安全审批策略与按逻辑会话隔离的授权状态。"""
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from enum import Enum
+import inspect
+from typing import Optional
+import warnings
 
 
-@dataclass
+class ApprovalMode(str, Enum):
+    INTERACTIVE = "interactive"
+    DENY_SENSITIVE = "deny_sensitive"
+    TRUSTED = "trusted"
+
+    @classmethod
+    def coerce(cls, value=None, *, auto_approve: bool | None = None):
+        if auto_approve is not None:
+            warnings.warn(
+                "auto_approve is deprecated; use ApprovalMode explicitly",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return cls.DENY_SENSITIVE if auto_approve else cls.INTERACTIVE
+        if value is None:
+            return cls.INTERACTIVE
+        if isinstance(value, cls):
+            return value
+        coerced = cls(str(value))
+        if coerced == cls.TRUSTED:
+            raise ValueError(
+                "ApprovalMode.TRUSTED must be passed as an explicit enum value"
+            )
+        return coerced
+
+
+@dataclass(frozen=True)
 class ApprovalResult:
-    """审批检查结果。
-
-    Attributes:
-        action: "allow"（放行）| "block"（硬拦截）| "confirm"（需确认）
-        pattern_key: 匹配到的模式键，用于 session 白名单
-        description: 人类可读的审批描述
-    """
     action: str
     pattern_key: Optional[str] = None
     description: Optional[str] = None
 
 
-class ApprovalEngine:
-    """工具调用的安全审批策略引擎。
+@dataclass(frozen=True)
+class ApprovalResolution:
+    allowed: bool
+    model_output: str = ""
+    error_code: str | None = None
+    description: str | None = None
 
-    管理审批规则检查、session 白名单、
-    allow/block/confirm 的完整生命周期。
-    """
+
+class ApprovalEngine:
+    """HARDLINE 永久阻止，confirm 按 ApprovalMode 解析。"""
 
     def __init__(self):
-        """初始化审批引擎。"""
-        pass
+        self._conversation_approved: dict[str, set[str]] = {}
 
-    # ── 审批检查 ──────────────────────────────────────────────
+    def _approved_for(self, conversation_id: str) -> set[str]:
+        return self._conversation_approved.setdefault(conversation_id or "", set())
 
-    def check(self, tool_name: str, args: dict) -> ApprovalResult:
-        """对一次工具调用执行审批检查。
-
-        Args:
-            tool_name: 工具名称（如 "bash"、"write_file"）。
-            args: 工具参数字典。
-
-        Returns:
-            ApprovalResult，action 为 allow/block/confirm。
-        """
+    def check(
+        self,
+        tool_name: str,
+        args: dict,
+        *,
+        conversation_id: str = "",
+    ) -> ApprovalResult:
         from tools.approval import _check_command, _check_write_file
 
+        approved = self._approved_for(conversation_id)
         if tool_name == "bash":
             action, pattern_key, description = _check_command(
-                args.get("command", "")
+                args.get("command", ""), approved=approved
             )
         elif tool_name == "write_file":
             action, pattern_key, description = _check_write_file(
-                args.get("path", ""), args.get("content", "")
+                args.get("path", ""),
+                args.get("content", ""),
+                approved=approved,
             )
         else:
-            # 无审批规则的工具默认放行
             return ApprovalResult(action="allow")
+        return ApprovalResult(action, pattern_key, description)
 
-        return ApprovalResult(
-            action=action,
-            pattern_key=pattern_key,
-            description=description,
-        )
+    def add_session_approval(self, conversation_id: str, pattern_key: str):
+        self._approved_for(conversation_id).add(pattern_key)
 
-    # ── Session 白名单 ────────────────────────────────────────
-
-    def add_session_approval(self, pattern_key: str):
-        """将 pattern_key 加入 session 白名单（用户选了 'session' 批准）。"""
-        from tools.approval import _session_approved
-        _session_approved.add(pattern_key)
-
-    def reset_session(self):
-        """清空 session 白名单（切换 session 时调用）。"""
-        from tools.approval import reset_session
-        reset_session()
-
-    # ── 审批结果解析 ──────────────────────────────────────────
+    def reset_session(self, conversation_id: str | None = None):
+        if conversation_id is None:
+            self._conversation_approved.clear()
+        else:
+            self._conversation_approved.pop(conversation_id, None)
 
     def resolve(
         self,
         check_result: ApprovalResult,
         tool_name: str = "",
         args: dict | None = None,
-        auto_approve: bool = False,
+        *,
+        mode: ApprovalMode | str | None = None,
         approval_callback=None,
-    ) -> Optional[str]:
-        """解析审批结果，确定工具应继续执行还是被阻止。
-
-        Args:
-            check_result: check() 返回的 ApprovalResult。
-            tool_name: 工具名（传给回调）。
-            args: 工具参数（传给回调）。
-            auto_approve: True 时跳过用户确认。
-            approval_callback: 用户确认回调，
-                签名 callback(tool_name, args, description) -> str。
-                返回 "allow"、"deny" 或 "session"。
-
-        Returns:
-            None — 工具应继续执行。
-            字符串 — 工具被阻止或拒绝，此字符串作为工具结果回填给 LLM。
-        """
-        if args is None:
-            args = {}
+        conversation_id: str = "",
+        auto_approve: bool | None = None,
+        run_context=None,
+    ) -> ApprovalResolution:
+        args = args or {}
+        approval_mode = ApprovalMode.coerce(mode, auto_approve=auto_approve)
 
         if check_result.action == "block":
-            return (
-                f"BLOCKED: {check_result.description}. "
-                f"This operation is never allowed. "
-                f"Do NOT attempt alternative ways to achieve the same goal."
+            description = check_result.description or "operation is permanently blocked"
+            return ApprovalResolution(
+                allowed=False,
+                model_output=(
+                    f"BLOCKED: {description}. This operation is never allowed. "
+                    "Do NOT attempt alternative ways to achieve the same goal."
+                ),
+                error_code="tool_not_allowed",
+                description=description,
             )
 
-        if check_result.action == "confirm":
-            if auto_approve:
-                return None  # 自动批准，放行
+        if check_result.action != "confirm":
+            return ApprovalResolution(allowed=True)
 
-            # 需要用户确认
-            choice = None
-            if approval_callback:
-                choice = approval_callback(
-                    tool_name, args, check_result.description
+        description = check_result.description or "sensitive operation"
+        if approval_mode == ApprovalMode.TRUSTED:
+            return ApprovalResolution(allowed=True)
+
+        if approval_mode == ApprovalMode.DENY_SENSITIVE:
+            return ApprovalResolution(
+                allowed=False,
+                model_output=(
+                    f"DENIED by approval policy: {description}. "
+                    "Operation was not executed because this Agent cannot request "
+                    "interactive approval."
+                ),
+                error_code="approval_denied",
+                description=description,
+            )
+
+        if approval_callback:
+            try:
+                inspect.signature(approval_callback).bind(
+                    tool_name, args, description, run_context=run_context
                 )
+            except (TypeError, ValueError):
+                choice = approval_callback(tool_name, args, description)
             else:
-                from tools.approval import _prompt_approval
-                choice = _prompt_approval(
-                    tool_name, args, check_result.description
+                choice = approval_callback(
+                    tool_name, args, description, run_context=run_context
                 )
+        else:
+            from tools.approval import _prompt_approval
+            choice = _prompt_approval(tool_name, args, description)
 
-            if choice == "deny":
-                return (
-                    f"DENIED by user: {check_result.description}. "
-                    f"Operation was not executed. "
-                    f"The user has explicitly rejected this action. "
-                    f"Do NOT retry with alternative commands or workarounds "
-                    f"to achieve the same outcome. "
-                    f"Inform the user that the operation was cancelled "
-                    f"and ask how they'd like to proceed."
-                )
+        if choice == "deny":
+            return ApprovalResolution(
+                allowed=False,
+                model_output=(
+                    f"DENIED by user: {description}. Operation was not executed. "
+                    "The user explicitly rejected this action. Do NOT retry through "
+                    "alternative commands or workarounds."
+                ),
+                error_code="approval_denied",
+                description=description,
+            )
 
-            if choice == "session" and check_result.pattern_key:
-                self.add_session_approval(check_result.pattern_key)
+        if choice not in ("once", "session"):
+            return ApprovalResolution(
+                allowed=False,
+                model_output=(
+                    f"DENIED by user: {description}. Operation was not executed "
+                    "because approval was not granted."
+                ),
+                error_code="approval_denied",
+                description=description,
+            )
 
-            return None  # 用户批准，放行
-
-        # action == "allow"
-        return None
+        if choice == "session" and check_result.pattern_key:
+            self.add_session_approval(conversation_id, check_result.pattern_key)
+        return ApprovalResolution(allowed=True)

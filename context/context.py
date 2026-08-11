@@ -74,6 +74,14 @@ class ConversationContext:
 
     # ── Token 估算 ──────────────────────────────────────────
 
+    def start_run(self):
+        """开始一次新的 Agent 运行，重建本次运行的迭代预算。
+
+        ConversationContext 可以跨用户回合复用，但迭代预算属于单次
+        ``run_conversation()``，不能因为 Agent 实例复用而累积到下一轮。
+        """
+        self._budget = IterationBudget(self._budget.max_total)
+
     def estimate_tokens(self, messages: list[dict]) -> int:
         """估算完整请求 token 数（含 system + tools schema 固定开销）。
 

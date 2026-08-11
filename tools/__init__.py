@@ -9,7 +9,12 @@
 
 from typing import Any
 
-from tools.registry import ToolRegistry
+from tools.registry import (
+    ToolExecutionContext,
+    ToolExecutionResult,
+    ToolMetadata,
+    ToolRegistry,
+)
 
 # 默认工具注册表实例（单例）
 _default_registry = ToolRegistry()
@@ -37,14 +42,15 @@ def truncate_output(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
     )
 
 
-def register(schema: dict):
+def register(schema: dict, metadata: ToolMetadata | None = None):
     """装饰器：将函数注册为工具。委托给默认 ToolRegistry。"""
-    return _default_registry.register(schema)
+    return _default_registry.register(schema, metadata=metadata)
 
 
 def get_schemas(
     include: set[str] | None = None,
     exclude: set[str] | None = None,
+    policy=None,
 ) -> list[dict]:
     """返回已注册工具的 schema 列表，支持白名单/黑名单过滤。
 
@@ -52,7 +58,11 @@ def get_schemas(
         include: 若提供，仅返回这些工具（白名单模式）
         exclude: 若提供，排除这些工具（黑名单模式）
     """
-    return _default_registry.get_schemas(include=include, exclude=exclude)
+    return _default_registry.get_schemas(
+        include=include,
+        exclude=exclude,
+        policy=policy,
+    )
 
 
 def execute(tool_call: dict) -> str:
@@ -64,23 +74,17 @@ def execute(tool_call: dict) -> str:
     return _default_registry.execute(tool_call)
 
 
+def execute_detailed(
+    tool_call: dict,
+    execution_context: ToolExecutionContext | None = None,
+) -> ToolExecutionResult:
+    """执行工具并返回结构化结果。"""
+    return _default_registry.execute_detailed(tool_call, execution_context)
+
+
 # 导入所有工具模块，触发 @register 装饰器执行
 # （装饰器通过 _default_registry.register() 将工具写入注册表）
 from tools import bash, files, search, memory  # noqa: E402, F401
 from tools import process_tool, web_extract, session_search, todo, clarify, code_execution  # noqa: E402, F401
 from tools import skills_tool, delegate, skill_manage  # noqa: E402, F401
 from tools import image_gen, browser  # noqa: E402, F401
-
-# 注册工具特定的重试参数修改器
-from tools.retry import register_retry_modifier, ErrorClass
-
-
-def _bash_retry_modifier(args: dict, attempt: int, error_class: str) -> dict:
-    """bash 超时时自动加倍 timeout 参数（上限 120s）。"""
-    if error_class == ErrorClass.TIMEOUT:
-        current_timeout = args.get("timeout", 30)
-        args["timeout"] = min(int(current_timeout * 2.0), 120)
-    return args
-
-
-register_retry_modifier("bash", _bash_retry_modifier)

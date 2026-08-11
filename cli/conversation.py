@@ -2,7 +2,8 @@
 
 from pathlib import Path
 
-from agent.agent import Agent
+from agent.runtime import AgentSpec
+from approval import ApprovalMode
 from cli.state import AppState
 from cli.commands import handle_slash_command
 from cli.plan import (
@@ -44,8 +45,32 @@ def _try_nudge(agent, state: "AppState", user_turns: int):
         agent.iters_since_skill = 0
 
     if nudge_type and state.conversation_history:
-        from evolution.nudge import spawn_nudge
-        spawn_nudge(agent.provider, state.conversation_history, nudge_type)
+        if nudge_type in ("memory", "both"):
+            state.pending_nudges.add("memory")
+        if nudge_type in ("skill", "both"):
+            state.pending_nudges.add("skill")
+
+    # Phase 4：把 Phase 1-3 暂存的触发合并成一批 Runtime 后台 Run。
+    runtime = getattr(state, "runtime", None)
+    if not runtime or not state.pending_nudges or not state.conversation_history:
+        return
+    pending = set(state.pending_nudges)
+    submit_type = "both" if pending == {"memory", "skill"} else pending.pop()
+    try:
+        from evolution.nudge import submit_nudge
+        submit_nudge(
+            runtime,
+            state.conversation_history,
+            submit_type,
+            conversation_id=state.conversation_id,
+            session_id=state.session_id,
+            model=getattr(agent.provider, "model", ""),
+            parent_tool_policy=agent.tool_policy,
+        )
+    except Exception:
+        # Runtime 关闭或登记失败时保留 pending，下一轮仍可合并提交。
+        return
+    state.pending_nudges.clear()
 
 
 def _handle_slash_commands(user_input: str, agent, state, db, model_name: str):
@@ -72,9 +97,16 @@ def _handle_slash_commands(user_input: str, agent, state, db, model_name: str):
     handled, history, sid, override_msg = handle_slash_command(
         user_input, state.conversation_history, db, state.session_id,
         agent=agent,
+        runtime=state.runtime,
+        conversation_id=state.conversation_id,
     )
     if handled:
         state.conversation_history = history
+        if sid and sid != state.session_id and state.runtime:
+            handle = state.runtime.replace_session(state.conversation_id, sid)
+            state.agent = handle.agent
+            state.conversation_id = handle.conversation_id
+            agent = handle.agent
         if sid:
             state.session_id = sid
         if user_input.strip().lower().startswith("/compress"):
@@ -94,21 +126,34 @@ def _execute_plan_mode(agent, state, db, renderer, model_name: str,
     state.status_text = f" ⚕ {model_name[:26]} │ [PLAN] analyzing..."
     state.invalidate()
 
-    plan_agent = Agent(
-        provider=agent.provider,
-        db=db,
-        clarify_callback=agent.clarify_callback,
-        auto_approve=True,
-        tool_filter={"include": PLAN_ALLOWED_TOOLS},
-        system_prompt_override=agent.system_prompt + PLAN_MODE_PROMPT,
-        max_iterations_override=50,
-    )
-
     try:
-        plan_result = plan_agent.run_conversation(
-            user_message=user_input, history=[],
-            renderer=renderer, session_id=state.session_id,
+        runtime = getattr(state, "runtime", None)
+        if runtime is None:
+            raise RuntimeError("Agent Runtime is not available for plan mode")
+        outcome = runtime.run_ephemeral(
+            spec=AgentSpec(
+                kind="plan",
+                system_prompt=agent.system_prompt + PLAN_MODE_PROMPT,
+                tool_policy={"include": set(PLAN_ALLOWED_TOOLS)},
+                approval_mode=ApprovalMode.DENY_SENSITIVE,
+                max_iterations=50,
+                persist_messages=False,
+            ),
+            request={
+                "task": plan_description or "implementation plan",
+                "user_message": user_input,
+                "model": agent.provider.model,
+            },
+            conversation_id=getattr(state, "conversation_id", None),
+            session_id=getattr(state, "session_id", None),
+            parent_tool_policy=agent.tool_policy,
+            renderer=renderer,
         )
+        if outcome.status.value != "SUCCEEDED" or outcome.result is None:
+            raise RuntimeError(
+                outcome.error_message or outcome.completion_reason or "plan run failed"
+            )
+        plan_result = outcome.result
     except KeyboardInterrupt:
         _cprint(f"\n{_GOLD}⚡ Plan interrupted{_RST}")
         state.command_running = False
@@ -186,6 +231,19 @@ def _post_process(agent, state, db, result, is_init_run: bool,
     # 进化系统：Nudge 触发
     _try_nudge(agent, state, user_turns)
 
+    # Curator 也必须经 Runtime 排队，避免在 CLI 外产生未登记的后台 Agent。
+    if cfg.get_evolution_config().get("enabled", False):
+        try:
+            from evolution.curator import maybe_run_curator
+            maybe_run_curator(
+                state.runtime,
+                conversation_id=state.conversation_id,
+                session_id=state.session_id,
+                model=getattr(agent.provider, "model", ""),
+            )
+        except Exception:
+            pass
+
     # 每 20 轮提示
     if user_turns > 0 and user_turns % 20 == 0:
         _cprint(
@@ -200,7 +258,6 @@ def conversation_loop(
     renderer: StreamRenderer,
 ):
     """后台消费用户输入并驱动 agent 对话。在 daemon 线程中运行。"""
-    agent = state.agent
     model_name = state.model_name
     context_window = state.context_window
 
@@ -209,6 +266,9 @@ def conversation_loop(
         if user_input is None:
             state.should_exit = True
             break
+
+        # /clear、/resume 会替换会话级主 Agent，每轮读取最新句柄。
+        agent = state.agent
 
         # ── 斜杠命令 ──────────────────────────────────────────────
         is_init_run = False
@@ -264,12 +324,21 @@ def conversation_loop(
         state.invalidate()
 
         try:
-            result = agent.run_conversation(
+            outcome = state.runtime.run_main_turn(
+                conversation_id=state.conversation_id,
                 user_message=user_input,
                 history=state.conversation_history,
                 renderer=renderer,
-                session_id=state.session_id,
             )
+            result = outcome.result
+            if result is None:
+                if outcome.status.value == "CANCELLED":
+                    state.command_running = False
+                    _cprint(f"\n{_GOLD}⚡ Interrupted{_RST}")
+                    state.status_text = f" ⚕ {model_name[:26]}"
+                    state.invalidate()
+                    continue
+                raise RuntimeError(outcome.error_message or "Agent run failed")
         except KeyboardInterrupt:
             _cprint(f"\n{_GOLD}⚡ Interrupted{_RST}")
             state.command_running = False
@@ -286,15 +355,13 @@ def conversation_loop(
 
         state.command_running = False
 
+        if outcome.status.value == "CANCELLED":
+            _cprint(f"\n{_GOLD}⚡ Interrupted{_RST}")
+        elif outcome.status.value == "FAILED" and outcome.error_message:
+            print_error(f"Agent run failed: {outcome.error_message}")
+
         # ── 后处理 ────────────────────────────────────────────────
         _post_process(agent, state, db, result, is_init_run,
                        model_name, context_window, user_input)
-
-    # 退出前尝试运行 curator
-    try:
-        from evolution.curator import maybe_run_curator
-        maybe_run_curator(provider=agent.provider)
-    except Exception:
-        pass
 
     db.end_session(state.session_id, end_reason="user_exit")

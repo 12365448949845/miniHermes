@@ -116,7 +116,7 @@ def execute_code(code: str, language: str = "python", timeout: int = None) -> st
             try:
                 sandbox = _create_sandbox(
                     Sandbox=Sandbox,
-                    timeout=code_config["sandbox_timeout"],
+                    timeout=min(code_config["sandbox_timeout"], effective_timeout),
                 )
                 output, error = _run_code_in_sandbox(
                     sandbox=sandbox,

@@ -132,6 +132,8 @@ class ContextCompressor:
         history: list[dict],
         db: Optional[SessionDB] = None,
         session_id: Optional[str] = None,
+        agent_run_id: Optional[str] = None,
+        run_context=None,
     ) -> tuple[list[dict], str]:
         """
         执行五阶段压缩。
@@ -156,7 +158,7 @@ class ContextCompressor:
         pruned_middle = self._prune_tool_outputs(middle)
 
         # ── Phase 3: LLM 摘要 ─────────────────────────────────────────
-        summary_text = self._generate_summary(pruned_middle)
+        summary_text = self._generate_summary(pruned_middle, run_context=run_context)
         if not summary_text:
             self._cooldown_until = time.time() + 60
             return history, session_id
@@ -208,6 +210,7 @@ class ContextCompressor:
                 content=full_summary,
                 token_count=len(full_summary) // 4,
                 msg_type="summary",
+                agent_run_id=agent_run_id,
             )
 
         # ── Anti-thrashing 追踪 ───────────────────────────────────────
@@ -322,7 +325,7 @@ class ContextCompressor:
     # Phase 3: LLM summarization
     # ══════════════════════════════════════════════════════════════════════
 
-    def _generate_summary(self, messages: list[dict]) -> Optional[str]:
+    def _generate_summary(self, messages: list[dict], run_context=None) -> Optional[str]:
         """调用 LLM 生成结构化摘要（支持迭代式）。"""
         conversation_text = self._format_for_summary(messages)
 
@@ -343,15 +346,40 @@ class ContextCompressor:
         summary_budget = self._calc_summary_budget(messages)
 
         try:
-            response = self._provider.client.chat.completions.create(
-                model=self._provider.model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt_content},
-                ],
-                temperature=0.3,
-                max_tokens=summary_budget,
-            )
+            request_messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt_content},
+            ]
+            if hasattr(self._provider, "complete"):
+                response = self._provider.complete(
+                    messages=request_messages,
+                    temperature=0.3,
+                    max_tokens=summary_budget,
+                    run_context=run_context,
+                )
+            else:
+                # 第三方兼容 Provider 的旧边界；内置 Provider 必须走 complete()。
+                if run_context and hasattr(run_context, "record_provider_attempt"):
+                    run_context.record_provider_attempt()
+                response = self._provider.client.chat.completions.create(
+                    model=self._provider.model,
+                    messages=request_messages,
+                    temperature=0.3,
+                    max_tokens=summary_budget,
+                )
+            if run_context and not hasattr(self._provider, "complete"):
+                usage = getattr(response, "usage", None)
+                details = getattr(usage, "completion_tokens_details", None)
+                usage_values = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                    "completion_tokens": getattr(usage, "completion_tokens", 0),
+                    "reasoning_tokens": getattr(details, "reasoning_tokens", 0),
+                }
+                if hasattr(run_context, "record_provider_usage"):
+                    run_context.record_provider_usage(**usage_values)
+                elif hasattr(run_context, "record_provider_call"):
+                    usage_values.pop("reasoning_tokens", None)
+                    run_context.record_provider_call(**usage_values)
             return (response.choices[0].message.content or "").strip()
         except KeyboardInterrupt:
             return None

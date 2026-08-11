@@ -34,9 +34,12 @@ class AppState:
 
     # 运行时引用（启动后注入）
     agent: object = None
+    runtime: object = None
     app: object = None
     session_id: str = ""
+    conversation_id: str = ""
     conversation_history: list = field(default_factory=list)
+    pending_nudges: set[str] = field(default_factory=set)
 
     # 主事件循环引用（供后台线程通过 run_in_terminal 桥接交互式 I/O）
     _main_loop: object = None
@@ -49,15 +52,27 @@ class AppState:
         except Exception:
             pass
 
-    def clear_clarify(self):
-        """清空 clarify UI 状态。"""
+    def clear_clarify(self, run_id: str | None = None) -> bool:
+        """只清理匹配 Run 的 clarify，防止旧 broker 清掉新面板。"""
+        if run_id is not None and (
+            not self.clarify_state
+            or self.clarify_state.get("run_id") != run_id
+        ):
+            return False
         self.clarify_state = None
         self.clarify_freetext = False
         self.clarify_deadline = 0.0
+        return True
 
-    def clear_approval(self):
-        """清空 approval UI 状态。"""
+    def clear_approval(self, run_id: str | None = None) -> bool:
+        """只清理匹配 Run 的 approval。"""
+        if run_id is not None and (
+            not self.approval_state
+            or self.approval_state.get("run_id") != run_id
+        ):
+            return False
         self.approval_state = None
+        return True
 
     def clear_plan_approval(self):
         """清空 plan 审批 UI 状态。"""

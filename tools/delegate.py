@@ -37,6 +37,16 @@ _SCHEMA = {
                         "Optional but strongly recommended for non-trivial tasks."
                     ),
                 },
+                "tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "uniqueItems": True,
+                    "description": (
+                        "Optional tool allowlist for this subagent. Omit to use the "
+                        "available delegate tool set; pass an empty list for no tools. "
+                        "The runtime always intersects this list with the parent policy."
+                    ),
+                },
             },
             "required": ["task"],
         },
@@ -45,6 +55,10 @@ _SCHEMA = {
 
 
 @register(_SCHEMA)
-def delegate_task(task: str, context: str = "") -> str:
+def delegate_task(
+    task: str,
+    context: str = "",
+    tools: list[str] | None = None,
+) -> str:
     """Placeholder — execution intercepted by Agent._execute_tool()."""
     return "Error: delegate_task must be executed within an Agent context."

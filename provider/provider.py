@@ -9,7 +9,10 @@ Provider 层：封装 OpenAI SDK，支持所有 OpenAI 兼容接口。
 
 import json
 import random
+import re
+import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -28,22 +31,46 @@ RETRY_API_MAX_RETRIES = 2
 # malformed tool_calls 等罕见错误的现场会落盘到这里，方便事后分析
 _DEBUG_DIR = Path.home() / ".minihermes" / "logs"
 
+_SECRET_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|token|password|secret)\b\s*[:=]\s*[^\s,;]+"
+    ),
+)
+
+
+def _sanitize_debug_text(value: str, limit: int = 500) -> str:
+    text = str(value or "").replace("\x00", "")
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text[:limit]
+
+
+def _sanitize_debug_payload(value):
+    if isinstance(value, dict):
+        return {str(key): _sanitize_debug_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_debug_payload(item) for item in value[:20]]
+    if isinstance(value, str):
+        return _sanitize_debug_text(value)
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return _sanitize_debug_text(str(value))
+
 
 def _dump_malformed_tool_call(payload: dict) -> Optional[Path]:
-    """把残缺的 tool call 现场落盘成 JSON，返回写入路径。失败时返回 None。"""
+    """只落盘脱敏、有界的残缺 tool call 诊断信息。"""
     try:
         _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-        # 不用 Date.now / random，用计数器后缀避免覆盖
-        stem = "malformed_tool_call"
-        i = 0
-        while True:
-            target = _DEBUG_DIR / f"{stem}_{i:04d}.json"
-            if not target.exists():
-                break
-            i += 1
-            if i > 9999:
-                break
-        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        target = _DEBUG_DIR / f"malformed_tool_call_{uuid.uuid4().hex}.json"
+        target.write_text(
+            json.dumps(
+                _sanitize_debug_payload(payload),
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         return target
     except OSError:
         return None
@@ -145,6 +172,37 @@ def _interruptible_sleep(seconds: float, interrupt_check: Optional[Callable[[], 
     return False
 
 
+class ProviderCallLimiter:
+    """跨流式和非流式调用共享的、可取消的 API 并发限制器。"""
+
+    def __init__(self, max_concurrency: int = 1):
+        self.max_concurrency = max(1, int(max_concurrency))
+        self._semaphore = threading.BoundedSemaphore(self.max_concurrency)
+
+    def acquire(
+        self,
+        interrupt_check: Optional[Callable[[], bool]] = None,
+        run_context=None,
+    ) -> bool:
+        """取得一个 permit；取消时返回 False，deadline 到期时抛出 TimeoutError。"""
+        while True:
+            if interrupt_check and interrupt_check():
+                return False
+            remaining = (
+                run_context.remaining_seconds()
+                if run_context and hasattr(run_context, "remaining_seconds")
+                else None
+            )
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("Agent run deadline exceeded while waiting for Provider")
+            wait_for = 0.1 if remaining is None else min(0.1, remaining)
+            if self._semaphore.acquire(timeout=max(0.001, wait_for)):
+                return True
+
+    def release(self):
+        self._semaphore.release()
+
+
 @dataclass
 class StreamResult:
     """流式调用完成后的标准化结果。"""
@@ -154,6 +212,7 @@ class StreamResult:
     finish_reason: str = ""     # "stop" | "tool_calls" | "length" 等
     prompt_tokens: int = 0      # 本轮发送的总 token 数（从 API usage 获取）
     completion_tokens: int = 0  # 本轮生成的 token 数
+    reasoning_tokens: int = 0   # completion 中可单独识别的 reasoning token
     interrupted: bool = False   # 是否被用户中断（Ctrl+C）
 
     @property
@@ -174,6 +233,22 @@ class Provider:
         self.model = model_cfg.get("name") or MODEL_NAME
         self.show_thinking = model_cfg.get("show_thinking", False)
         self.reason = model_cfg.get("reason", True)
+        self._call_limiter: ProviderCallLimiter | None = None
+
+    def set_call_limiter(self, limiter: ProviderCallLimiter | None):
+        """由 Runtime 注入共享 limiter；无 Runtime 时保留无限制的旧行为。"""
+        self._call_limiter = limiter
+
+    def _acquire_call_permit(self, interrupt_check=None, run_context=None) -> bool:
+        limiter = getattr(self, "_call_limiter", None)
+        if limiter is None:
+            return True
+        return limiter.acquire(interrupt_check, run_context)
+
+    def _release_call_permit(self):
+        limiter = getattr(self, "_call_limiter", None)
+        if limiter is not None:
+            limiter.release()
 
     def _sanitize_messages(self, messages: list[dict]) -> list[dict]:
         """浅拷贝 messages，只保留 API 认可的字段。
@@ -225,6 +300,7 @@ class Provider:
         on_tool_start: Optional[Callable[[str], None]] = None,
         interrupt_check: Optional[Callable[[], bool]] = None,
         renderer=None,
+        run_context=None,
     ) -> StreamResult:
         """发起一次流式 API 调用，对瞬态错误（429/5xx/网络中断）自动重试。
 
@@ -235,13 +311,30 @@ class Provider:
         max_attempts = RETRY_API_MAX_RETRIES + 1
 
         for attempt in range(1, max_attempts + 1):
+            if interrupt_check and interrupt_check():
+                return StreamResult(
+                    finish_reason="interrupted",
+                    interrupted=True,
+                )
+            if run_context and hasattr(run_context, "record_provider_attempt"):
+                run_context.record_provider_attempt()
+            permit_acquired = False
             try:
+                permit_acquired = self._acquire_call_permit(
+                    interrupt_check, run_context
+                )
+                if not permit_acquired:
+                    return StreamResult(
+                        finish_reason="interrupted",
+                        interrupted=True,
+                    )
                 return self._stream_once(
                     messages, tools,
                     on_delta=on_delta,
                     on_thinking=on_thinking,
                     on_tool_start=on_tool_start,
                     interrupt_check=interrupt_check,
+                    run_context=run_context,
                 )
             except Exception as exc:
                 # 用户主动中断 → 立即抛，不重试
@@ -266,6 +359,17 @@ class Provider:
                     f"\n{_AMBER}⟳ API error ({type(exc).__name__}), "
                     f"retrying in {delay:.1f}s (attempt {attempt + 1}/{max_attempts})...{_RST}"
                 )
+                if run_context and hasattr(run_context, "emit_event"):
+                    run_context.emit_event(
+                        "provider_retrying",
+                        {
+                            "attempt": attempt + 1,
+                            "max_attempts": max_attempts,
+                            "error_class": err_class,
+                            "error_type": type(exc).__name__,
+                            "delay_seconds": round(delay, 3),
+                        },
+                    )
 
                 # 重置 renderer 以便重试输出干净
                 if renderer is not None:
@@ -276,6 +380,9 @@ class Provider:
 
                 if _interruptible_sleep(delay, interrupt_check):
                     raise
+            finally:
+                if permit_acquired:
+                    self._release_call_permit()
 
         # unreachable
         raise RuntimeError("stream retry loop exited unexpectedly")
@@ -288,6 +395,7 @@ class Provider:
         on_thinking: Optional[Callable[[str], None]] = None,
         on_tool_start: Optional[Callable[[str], None]] = None,
         interrupt_check: Optional[Callable[[], bool]] = None,
+        run_context=None,
     ) -> StreamResult:
         """单次流式 API 调用（不含重试逻辑）。"""
         kwargs = {
@@ -313,6 +421,17 @@ class Provider:
             }
 
         kwargs["messages"] = self._sanitize_messages(kwargs["messages"])
+        remaining = (
+            run_context.remaining_seconds()
+            if run_context and hasattr(run_context, "remaining_seconds")
+            else None
+        )
+        if remaining is not None:
+            if remaining <= 0:
+                raise TimeoutError("Agent run deadline exceeded before Provider request")
+            kwargs["timeout"] = max(0.1, remaining)
+        if interrupt_check and interrupt_check():
+            raise InterruptedError("Agent run cancelled before Provider request")
         response = self.client.chat.completions.create(**kwargs)
 
         # 累积变量
@@ -327,6 +446,7 @@ class Provider:
         announced_tools: set[int] = set()  # 已通知 on_tool_start 的 tool index
         prompt_tokens = 0
         completion_tokens = 0
+        reasoning_tokens = 0
         chunk_count = 0  # 收到的 SSE chunk 总数（用于诊断流是否被提前关闭）
 
         was_interrupted = False
@@ -341,6 +461,12 @@ class Provider:
             if hasattr(chunk, "usage") and chunk.usage:
                 prompt_tokens = chunk.usage.prompt_tokens or 0
                 completion_tokens = chunk.usage.completion_tokens or 0
+                details = getattr(
+                    chunk.usage, "completion_tokens_details", None
+                )
+                reasoning_tokens = int(
+                    getattr(details, "reasoning_tokens", 0) or 0
+                )
 
             if not chunk.choices:
                 continue
@@ -391,9 +517,9 @@ class Provider:
 
         # ── 诊断：检测残缺的 tool_calls ──────────────────────────────────────
         # 当 finish_reason="length"（撞 max_tokens 上限）、网关丢包、或上游断流时，
-        # 最后一个工具的 arguments 经常是半个 JSON。这里打印精细诊断信息并落盘
-        # 完整 raw，方便事后区分根因（max_tokens 截断 vs 网关 buffer 截断 vs
-        # 模型自吐非法字符）。
+        # 最后一个工具的 arguments 经常是半个 JSON。这里打印精细诊断信息，
+        # 并只落盘脱敏后的有界片段，辅助区分 max_tokens 截断、网关截断或
+        # 模型生成非法字符等根因。
         if raw_tool_calls and not was_interrupted:
             for idx in sorted(raw_tool_calls.keys()):
                 raw_args = raw_tool_calls[idx].get("arguments", "")
@@ -423,7 +549,13 @@ class Provider:
                     # 累积统计：chunk 数 + 最后一个 chunk 的大小（看是否中途被切）
                     stats = tool_chunk_stats.get(idx, {})
 
-                    preview = raw_args if len(raw_args) <= 300 else raw_args[:150] + " ... " + raw_args[-150:]
+                    raw_preview = (
+                        raw_args
+                        if len(raw_args) <= 300
+                        else raw_args[:150] + " ... " + raw_args[-150:]
+                    )
+                    preview = _sanitize_debug_text(raw_preview, 320)
+                    safe_tail_repr = _sanitize_debug_text(tail_repr, 240)
 
                     _cprint(
                         f"\n{_AMBER}⚠ malformed tool args"
@@ -437,10 +569,10 @@ class Provider:
                         f" escaped_newlines={escaped_newlines},"
                         f" bad_ctrl_chars={bad_ctrl}): {e}{_RST}\n"
                         f"{_DIM}raw: {preview}{_RST}\n"
-                        f"{_DIM}tail_repr: {tail_repr}{_RST}"
+                        f"{_DIM}tail_repr: {safe_tail_repr}{_RST}"
                     )
 
-                    # 完整 raw 落盘（CLI 截断了大部分内容，事后用编辑器看更清楚）
+                    # 只保存统计和脱敏后的有界片段，不复制完整工具参数。
                     dump_path = _dump_malformed_tool_call({
                         "tool_name": name,
                         "tool_index": idx,
@@ -458,9 +590,9 @@ class Provider:
                         "escaped_newlines": escaped_newlines,
                         "bad_ctrl_chars": bad_ctrl,
                         "json_error": str(e),
-                        "head_repr": head_repr,
-                        "tail_repr": tail_repr,
-                        "raw_arguments": raw_args,
+                        "head_repr": _sanitize_debug_text(head_repr, 180),
+                        "tail_repr": safe_tail_repr,
+                        "arguments_preview": preview,
                     })
                     if dump_path is not None:
                         _cprint(f"{_DIM}full dump: {dump_path}{_RST}")
@@ -491,8 +623,86 @@ class Provider:
             finish_reason="interrupted" if was_interrupted else finish_reason,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            reasoning_tokens=reasoning_tokens,
             interrupted=was_interrupted,
         )
+
+    def complete(
+        self,
+        *,
+        messages: list[dict],
+        max_tokens: int,
+        temperature: float = 0.3,
+        run_context=None,
+        interrupt_check: Optional[Callable[[], bool]] = None,
+    ):
+        """非流式 Provider 边界，供上下文摘要等内部模型调用复用。"""
+        check = interrupt_check or (
+            run_context.is_cancelled
+            if run_context and hasattr(run_context, "is_cancelled")
+            else None
+        )
+        max_attempts = RETRY_API_MAX_RETRIES + 1
+        for attempt in range(1, max_attempts + 1):
+            if check and check():
+                raise InterruptedError("Agent run stopped before Provider request")
+            if run_context and hasattr(run_context, "record_provider_attempt"):
+                run_context.record_provider_attempt()
+            kwargs = {
+                "model": self.model,
+                "messages": self._sanitize_messages(messages),
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            remaining = (
+                run_context.remaining_seconds()
+                if run_context and hasattr(run_context, "remaining_seconds")
+                else None
+            )
+            if remaining is not None:
+                if remaining <= 0:
+                    raise TimeoutError("Agent run deadline exceeded before Provider request")
+                kwargs["timeout"] = max(0.1, remaining)
+            permit_acquired = False
+            try:
+                permit_acquired = self._acquire_call_permit(check, run_context)
+                if not permit_acquired:
+                    raise InterruptedError("Agent run stopped while waiting for Provider")
+                if check and check():
+                    raise InterruptedError("Agent run stopped before Provider request")
+                response = self.client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                if check and check():
+                    raise
+                error_class = classify_api_error(exc)
+                if error_class in ("permanent", "context_overflow") or attempt >= max_attempts:
+                    raise
+                delay = min(_extract_retry_after(exc) or jittered_backoff(attempt), 60.0)
+                if run_context and hasattr(run_context, "emit_event"):
+                    run_context.emit_event("provider_retrying", {
+                        "attempt": attempt + 1,
+                        "max_attempts": max_attempts,
+                        "error_class": error_class,
+                        "error_type": type(exc).__name__,
+                        "delay_seconds": round(delay, 3),
+                    })
+                if _interruptible_sleep(delay, check):
+                    raise InterruptedError("Agent run stopped during Provider retry")
+                continue
+            finally:
+                if permit_acquired:
+                    self._release_call_permit()
+
+            usage = getattr(response, "usage", None)
+            details = getattr(usage, "completion_tokens_details", None)
+            if run_context and hasattr(run_context, "record_provider_usage"):
+                run_context.record_provider_usage(
+                    prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                    completion_tokens=getattr(usage, "completion_tokens", 0),
+                    reasoning_tokens=getattr(details, "reasoning_tokens", 0),
+                )
+            return response
+        raise RuntimeError("completion retry loop exited unexpectedly")
 
     def build_assistant_message(self, result: StreamResult) -> dict:
         """将 StreamResult 转换为可追加到 messages 的 assistant dict。"""

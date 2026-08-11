@@ -14,6 +14,7 @@ import difflib
 import io
 import json
 import os
+import queue
 import re
 
 from prompt_toolkit import print_formatted_text
@@ -289,6 +290,41 @@ class SubagentRenderer:
     def finalize(self):
         if self._started:
             _cprint(f"{_SUBAGENT_INDENT}{_CYAN}└─ done ({self._tool_count} tool calls){_RST}")
+
+
+class QueuedRenderer:
+    """将工作线程的渲染事件交回调用线程，避免终端输出交错。"""
+
+    def __init__(self, target):
+        self._target = target
+        self._events = queue.SimpleQueue()
+
+    def reset(self):
+        self._events.put(("reset", ()))
+
+    def on_thinking(self, text: str):
+        self._events.put(("on_thinking", (text,)))
+
+    def on_delta(self, text: str):
+        self._events.put(("on_delta", (text,)))
+
+    def on_tool_start(self, tool_name: str):
+        self._events.put(("on_tool_start", (tool_name,)))
+
+    def on_tool_result(self, tool_name: str, result: str):
+        self._events.put(("on_tool_result", (tool_name, result)))
+
+    def finalize(self):
+        self._events.put(("finalize", ()))
+
+    def drain(self):
+        """在拥有终端的线程中按原事件顺序渲染。"""
+        while True:
+            try:
+                method, args = self._events.get_nowait()
+            except queue.Empty:
+                return
+            getattr(self._target, method)(*args)
 
 
 # ── 失败检测 ────────────────────────────────────────────────────────────────────

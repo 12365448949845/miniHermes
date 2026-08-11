@@ -21,6 +21,9 @@ SLASH_COMMANDS: dict[str, str] = {
     "/init":      "Scan project and generate minihermes.md",
     "/history":   "Show current conversation length",
     "/sessions":  "List recent sessions",
+    "/agents":    "List recent Agent runs",
+    "/agent":     "Show one Agent run",
+    "/cancel":    "Request cancellation of an Agent run",
     "/resume":    "Resume a previous session",
     "/title":     "Set title for current session",
     "/sysprompt": "Print current system prompt (debug)",
@@ -73,7 +76,7 @@ def register_skill_commands():
 
 def handle_slash_command(
     cmd: str, history: list, db: SessionDB, session_id: str,
-    agent=None,
+    agent=None, runtime=None, conversation_id: str | None = None,
 ) -> tuple[bool, list, str, Optional[str]]:
     """
     处理斜杠命令。
@@ -124,6 +127,110 @@ def handle_slash_command(
                 title = s["title"] or ""
                 active = " ◀" if s["id"] == session_id else ""
                 print(f"{s['id']:<14} {s['message_count']:>4}  {t:<20} {title}{active}")
+        return True, history, session_id, None
+
+    if command == "/agents":
+        if runtime is None:
+            print("[Agent Runtime is not available]")
+            return True, history, session_id, None
+        runs = runtime.list_runs(conversation_id=conversation_id, limit=20)
+        if not runs:
+            print("[no Agent runs found for this conversation]")
+            return True, history, session_id, None
+        print(f"{'RUN ID':<32} {'KIND':<12} {'STATUS':<18} {'TIME':>8}  TASK")
+        print("─" * 96)
+        now = time.time()
+        for run in runs:
+            started = run.get("started_at") or run.get("created_at") or now
+            finished = run.get("finished_at") or now
+            duration = max(0.0, finished - started)
+            task = runtime.get_task(run["task_id"]) or {}
+            title = (task.get("title") or "")[:40]
+            print(
+                f"{run['run_id']:<32} {run['agent_kind']:<12} "
+                f"{run['status']:<18} {duration:>7.1f}s  {title}"
+            )
+        return True, history, session_id, None
+
+    if command == "/agent":
+        if runtime is None:
+            print("[Agent Runtime is not available]")
+            return True, history, session_id, None
+        run_ref = arg.strip()
+        if not run_ref:
+            print("[usage: /agent <run_id>]")
+            return True, history, session_id, None
+        run = runtime.get_run(run_ref)
+        if run is None:
+            matches = [
+                item for item in runtime.list_runs(limit=200)
+                if item["run_id"].startswith(run_ref)
+            ]
+            if len(matches) == 1:
+                run = matches[0]
+            elif len(matches) > 1:
+                print(f"[run id prefix is ambiguous: {run_ref}]")
+                return True, history, session_id, None
+        if run is None:
+            print(f"[Agent run not found: {run_ref}]")
+            return True, history, session_id, None
+
+        task = runtime.get_task(run["task_id"]) or {}
+        print(f"[Agent run {run['run_id']}]")
+        print(f"kind: {run['agent_kind']}  status: {run['status']}  attempt: {run['attempt']}")
+        print(f"task: {task.get('title') or run['task_id']}")
+        if run.get("parent_run_id"):
+            print(f"parent run: {run['parent_run_id']}")
+        print(
+            f"iterations: {run['iterations_used']}/{run['max_iterations']}  "
+            f"provider calls: {run['provider_attempts']}  "
+            f"tokens: {run['prompt_tokens']} in / {run['completion_tokens']} out"
+        )
+        if run.get("completion_reason"):
+            print(f"completion: {run['completion_reason']}")
+        if run.get("error_message"):
+            print(f"error: {run['error_message']}")
+        events = runtime.list_events(run["run_id"])
+        if events:
+            event_names = " → ".join(event["event_type"] for event in events)
+            print(f"events: {event_names}")
+        tool_executions = runtime.list_tool_executions(run["run_id"])
+        if tool_executions:
+            print("tools:")
+            for execution in tool_executions:
+                detail = execution["status"]
+                if execution.get("error_code"):
+                    detail += f"/{execution['error_code']}"
+                print(
+                    f"  {execution['tool_name']}: {detail}  "
+                    f"attempts={execution['attempts']}"
+                )
+        return True, history, session_id, None
+
+    if command == "/cancel":
+        if runtime is None:
+            print("[Agent Runtime is not available]")
+            return True, history, session_id, None
+        run_ref = arg.strip()
+        if not run_ref:
+            print("[usage: /cancel <run_id>]")
+            return True, history, session_id, None
+        run = runtime.get_run(run_ref)
+        if run is None:
+            matches = [
+                item for item in runtime.list_runs(limit=200)
+                if item["run_id"].startswith(run_ref)
+            ]
+            if len(matches) == 1:
+                run = matches[0]
+            elif len(matches) > 1:
+                print(f"[run id prefix is ambiguous: {run_ref}]")
+                return True, history, session_id, None
+        if run is None:
+            print(f"[Agent run not found: {run_ref}]")
+            return True, history, session_id, None
+        status = runtime.cancel(run["run_id"])
+        print(f"[cancel request for {run['run_id']}: {status}]")
         return True, history, session_id, None
 
     if command == "/resume":
@@ -178,6 +285,8 @@ def handle_slash_command(
             "/compress    — manually trigger context compression\n"
             "/history     — show current session info\n"
             "/sessions    — list recent sessions\n"
+            "/agents      — list recent Agent runs\n"
+            "/agent <id>  — show one Agent run\n"
             "/resume [id] — resume a previous session\n"
             "/title <name>— name the current session\n"
             "/sysprompt   — print current system prompt (debug)\n"

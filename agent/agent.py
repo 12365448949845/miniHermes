@@ -24,6 +24,13 @@ from session import SessionDB
 from context.compressor import ContextCompressor
 from context import ConversationContext
 import config as cfg
+from approval import ApprovalEngine, ApprovalMode
+from tools.registry import (
+    ToolAccessPolicy,
+    ToolExecutionContext,
+    ToolStatus,
+    resolve_tool_access_policy,
+)
 
 
 @dataclass
@@ -34,6 +41,24 @@ class ConversationResult:
     messages: list[dict]         # 更新后的完整对话历史（不含 system）
     session_id: str = ""         # 当前 session_id（压缩后可能改变）
     compressed: bool = False     # 本轮是否发生了压缩
+    completion_reason: str = "completed"
+    iterations_used: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+
+
+class AgentRunAborted(Exception):
+    """不可恢复的 Agent 失败，同时携带已闭合的部分对话历史。"""
+
+    def __init__(self, error_code: str, safe_message: str,
+                 partial_result: ConversationResult,
+                 completion_reason: str = "internal_error"):
+        super().__init__(safe_message)
+        self.error_code = error_code
+        self.safe_message = safe_message
+        self.partial_result = partial_result
+        self.completion_reason = completion_reason
 
 
 class Agent:
@@ -43,17 +68,36 @@ class Agent:
         db: SessionDB = None,
         clarify_callback=None,
         approval_callback=None,
-        auto_approve: bool = False,
+        auto_approve: bool | None = None,
         tool_filter: dict | None = None,
+        tool_policy: ToolAccessPolicy | dict | None = None,
+        agent_kind: str = "main_turn",
+        approval_mode: ApprovalMode | str | None = None,
+        approval_engine: ApprovalEngine | None = None,
+        tool_db: SessionDB | None = None,
         system_prompt_override: str | None = None,
         max_iterations_override: int | None = None,
+        runtime=None,
     ):
         self.provider = provider
         self.db = db
         self.clarify_callback = clarify_callback
         self.approval_callback = approval_callback
         self.auto_approve = auto_approve
-        self._tool_filter = tool_filter or {}
+        self.agent_kind = agent_kind
+        raw_policy = tool_policy if tool_policy is not None else tool_filter
+        self.tool_policy = resolve_tool_access_policy(
+            raw_policy,
+            tool_registry.get_tool_manager().get_names(),
+            kind=agent_kind,
+        )
+        self.approval_mode = ApprovalMode.coerce(
+            approval_mode,
+            auto_approve=auto_approve,
+        )
+        self._approval = approval_engine or ApprovalEngine()
+        self.tool_db = tool_db or db
+        self.runtime = runtime
 
         # system prompt：支持外部覆盖（子 Agent 使用精简 prompt）
         if system_prompt_override is not None:
@@ -68,9 +112,6 @@ class Agent:
         )
         # 上下文压缩器
         self._compressor = ContextCompressor(provider)
-        # 安全审批引擎
-        from approval import ApprovalEngine
-        self._approval = ApprovalEngine()
         # 对话状态容器（token 追踪、预算、压缩触发、进化计数器）
         tools_json = json.dumps(self._get_tool_schemas())
         self._ctx = ConversationContext(
@@ -80,13 +121,13 @@ class Agent:
         )
         # 中断请求
         self._interrupt_requested = False
+        self._active_run_context = None
+        self._active_session_id = None
+        self._delegate_batch_results: dict[str, str] | None = None
 
     def _get_tool_schemas(self) -> list[dict]:
         """返回经过过滤的工具 schema 列表。"""
-        return tool_registry.get_schemas(
-            include=self._tool_filter.get("include"),
-            exclude=self._tool_filter.get("exclude"),
-        )
+        return tool_registry.get_schemas(policy=self.tool_policy)
 
     def interrupt(self):
         """外部请求中断当前对话循环。"""
@@ -137,7 +178,13 @@ class Agent:
         /init 创建 minihermes.md 后调用，使新的上下文文件立即生效。
         """
         memory_store = memory_store or get_memory_store()
-        tool_names = tool_names or tool_registry.get_tool_manager().get_names()
+        if tool_names is None:
+            policy = getattr(self, "tool_policy", None)
+            tool_names = (
+                policy.effective_tools
+                if policy is not None
+                else tool_registry.get_tool_manager().get_names()
+            )
         cwd = cwd or os.getcwd()
         self.system_prompt = build_system_prompt(
             model_name=self.provider.model,
@@ -165,25 +212,150 @@ class Agent:
                 question=args.get("question", ""),
                 callback=self.clarify_callback,
                 choices=args.get("choices"),
+                run_context=self._active_run_context,
             )
 
         if tool_name == "delegate_task":
-            from agent.delegate import run_delegate, DelegationRequest
+            cached = self._delegate_batch_results
+            if cached is not None and tool_call.get("id") in cached:
+                return cached[tool_call["id"]]
+
+            from agent.delegate import (
+                DelegationRequest,
+                build_delegate_request,
+                build_delegate_renderer,
+                build_delegate_spec,
+            )
 
             request = DelegationRequest(
                 task=args.get("task", ""),
                 context=args.get("context", ""),
+                tools=(
+                    None
+                    if args.get("tools") is None
+                    else set(args.get("tools") or [])
+                ),
             )
-            result = run_delegate(request, self.provider)
-            if result.success:
-                return result.response
-            return f"[Delegation failed: {result.error}]"
+            run_context = self._active_run_context
+            if self.runtime is None or run_context is None:
+                return "Error: Delegation failed: runtime context is unavailable"
+            spec = build_delegate_spec(request)
+            payload = build_delegate_request(request, model=self.provider.model)
+            outcome = self.runtime.run_ephemeral(
+                spec=spec,
+                request=payload,
+                conversation_id=run_context.conversation_id,
+                session_id=self._active_session_id,
+                parent_task_id=run_context.task_id,
+                parent_run_id=run_context.run_id,
+                parent_run_context=run_context,
+                renderer=build_delegate_renderer(request),
+            )
+            if outcome.status.value == "SUCCEEDED" and outcome.result:
+                return outcome.result.final_response or "(subagent produced no response)"
+            return f"Error: Delegation failed: {outcome.error_message or outcome.completion_reason}"
 
-        return tool_registry.execute(tool_call)
+        if tool_name == "session_search" and self.tool_db is not None:
+            from tools.session_search import _list_recent, _search
+
+            limit = min(max(int(args.get("limit", 5)), 1), 10)
+            query = args.get("query")
+            return (
+                _search(self.tool_db, query, limit)
+                if query
+                else _list_recent(self.tool_db, limit)
+            )
+
+        return f"Error: no special executor is configured for tool '{tool_name}'"
+
+    def _run_delegate_batch(
+        self,
+        tool_calls: list[dict],
+        run_context,
+        session_id: str | None,
+    ) -> dict[str, str] | None:
+        """为纯 delegate_task 响应构造批次；无资格时返回 None 走旧串行路径。"""
+        if self.runtime is None or run_context is None:
+            return None
+
+        from agent.delegate import (
+            DelegationRequest,
+            build_delegate_renderer,
+            build_delegate_request,
+            build_delegate_spec,
+        )
+        from agent.runtime import DelegateBatchItem, RunStatus
+
+        policy = getattr(run_context, "tool_policy", None) or self.tool_policy
+        items = []
+        for tool_call in tool_calls:
+            try:
+                raw_args = tool_call["function"].get("arguments", "{}")
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            if not isinstance(args, dict):
+                return None
+            task = args.get("task", "")
+            requested_tools = args.get("tools")
+            if (
+                not isinstance(task, str)
+                or not isinstance(args.get("context", ""), str)
+                or (
+                    requested_tools is not None
+                    and (
+                        not isinstance(requested_tools, list)
+                        or not all(isinstance(name, str) for name in requested_tools)
+                    )
+                )
+            ):
+                return None
+            allowed, _ = policy.allows("delegate_task", args)
+            if not allowed:
+                return None
+            request = DelegationRequest(
+                task=task,
+                context=args.get("context", ""),
+                tools=None if requested_tools is None else set(requested_tools),
+            )
+            items.append(DelegateBatchItem(
+                spec=build_delegate_spec(request),
+                request=build_delegate_request(request, model=self.provider.model),
+                renderer=build_delegate_renderer(request),
+            ))
+
+        batch = self.runtime.run_delegate_batch(
+            items=items,
+            conversation_id=run_context.conversation_id,
+            session_id=session_id,
+            parent_task_id=run_context.task_id,
+            parent_run_id=run_context.run_id,
+            parent_run_context=run_context,
+            parent_tool_policy=policy,
+        )
+        results: dict[str, str] = {}
+        for tool_call, outcome in zip(tool_calls, batch.outcomes):
+            if outcome.status == RunStatus.SUCCEEDED and outcome.result:
+                results[tool_call["id"]] = (
+                    outcome.result.final_response
+                    or "(subagent produced no response)"
+                )
+            elif outcome.status == RunStatus.TIMED_OUT:
+                results[tool_call["id"]] = (
+                    "TIMED_OUT: Delegate batch deadline was reached."
+                )
+            else:
+                results[tool_call["id"]] = (
+                    "Error: Delegation failed: "
+                    f"{outcome.error_message or outcome.completion_reason}"
+                )
+        return results
 
     def _process_tool_call(self, tc: dict, result: StreamResult,
                            messages: list[dict], working_history: list[dict],
-                           renderer, session_id: str) -> None:
+                           renderer, session_id: str,
+                           agent_run_id: str | None = None,
+                           run_context=None) -> None:
         """处理单个 tool_call 的完整生命周期。
 
         JSON 解析 → 审批检查 → 工具执行 → 计数器更新 →
@@ -192,49 +364,95 @@ class Agent:
         tool_name = tc["function"]["name"]
         raw_args = tc["function"].get("arguments", "{}")
 
-        # ── 1. 解析参数 ──────────────────────────────────────────
-        try:
-            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-        except json.JSONDecodeError as e:
-            self._handle_json_error(tc, tool_name, raw_args, e, result,
-                                    messages, working_history, renderer, session_id)
-            return
-
-        # ── 2. 审批检查 ──────────────────────────────────────────
-        check_result = self._approval.check(tool_name, args)
-
-        # diff 快照（write_file 执行前读取旧内容）
-        old_content = self._snapshot_old_content(tool_name, args, check_result.action)
-
-        # 解析审批结果
-        blocked_msg = self._approval.resolve(
-            check_result, tool_name=tool_name, args=args,
-            auto_approve=self.auto_approve,
-            approval_callback=self.approval_callback,
+        policy = (
+            getattr(run_context, "tool_policy", None)
+            or self.tool_policy
         )
 
-        # ── 3. 执行工具 ──────────────────────────────────────────
-        if blocked_msg is not None:
-            tool_result = blocked_msg
-        else:
-            tool_result = self._execute_tool(tool_name, tc, args)
+        # diff 快照只在参数有效、策略允许且不属于硬拦截时读取。
+        args = None
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            if not isinstance(args, dict):
+                args = None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            args = None
 
-        if renderer:
-            renderer.on_tool_result(tool_name, tool_result)
+        old_content = None
+        if args is not None:
+            allowed, _ = policy.allows(tool_name, args)
+            if allowed:
+                check_result = self._approval.check(
+                    tool_name,
+                    args,
+                    conversation_id=getattr(run_context, "conversation_id", ""),
+                )
+                old_content = self._snapshot_old_content(
+                    tool_name, args, check_result.action
+                )
+
+        previous_context = self._active_run_context
+        previous_session_id = self._active_session_id
+        self._active_run_context = run_context
+        self._active_session_id = session_id
+        try:
+            execution = tool_registry.execute_detailed(
+                tc,
+                ToolExecutionContext(
+                    policy=policy,
+                    approval_engine=self._approval,
+                    approval_mode=self.approval_mode,
+                    approval_callback=self.approval_callback,
+                    run_context=run_context,
+                    db=self.tool_db,
+                    special_executor=self._execute_tool,
+                    special_tool_names=frozenset({
+                        "clarify", "delegate_task", "session_search",
+                    }),
+                    cancel_check=(
+                        run_context.is_cancelled
+                        if run_context and hasattr(run_context, "is_cancelled")
+                        else lambda: self._interrupt_requested
+                    ),
+                ),
+            )
+        finally:
+            self._active_run_context = previous_context
+            self._active_session_id = previous_session_id
+
+        tool_result = execution.model_output
 
         # ── 4. 进化计数器重置 ────────────────────────────────────
-        if tool_name == "skill_manage":
+        if execution.status == ToolStatus.SUCCEEDED and tool_name == "skill_manage":
             self._ctx.reset_skill_iter()
-        elif tool_name == "memory":
+        elif execution.status == ToolStatus.SUCCEEDED and tool_name == "memory":
             self._ctx.reset_memory_turn()
 
         # ── 5. inline diff ───────────────────────────────────────
-        if tool_name == "write_file" and old_content is not None and renderer:
+        if (
+            execution.status == ToolStatus.SUCCEEDED
+            and tool_name == "write_file"
+            and old_content is not None
+            and renderer
+            and args is not None
+        ):
             new_content = args.get("content", "")
             if old_content != new_content:
                 render_diff(old_content, new_content, args.get("path", ""))
 
         # ── 6. 构建结果消息并追加 ────────────────────────────────
+        self._append_tool_result(
+            tc, tool_name, tool_result, messages, working_history,
+            renderer, session_id, agent_run_id,
+        )
+
+    def _append_tool_result(self, tc: dict, tool_name: str, tool_result: str,
+                            messages: list[dict], working_history: list[dict],
+                            renderer, session_id: str | None,
+                            agent_run_id: str | None = None):
+        """追加一个完整的 tool result 到内存历史和 SessionDB。"""
+        if renderer:
+            renderer.on_tool_result(tool_name, tool_result)
         result_msg = self.provider.build_tool_result_message(
             tool_call_id=tc["id"], result=tool_result,
         )
@@ -242,49 +460,36 @@ class Agent:
         result_msg["tool_name"] = tool_name
         messages.append(result_msg)
         working_history.append(result_msg)
-
         if self.db and session_id:
             self.db.append_message(
                 session_id, role="tool", content=tool_result,
                 tool_call_id=tc["id"], tool_name=tool_name,
                 token_count=len(tool_result) // 4,
+                agent_run_id=agent_run_id,
             )
 
-    def _handle_json_error(self, tc: dict, tool_name: str, raw_args: str,
-                           error: json.JSONDecodeError, result: StreamResult,
-                           messages: list[dict], working_history: list[dict],
-                           renderer, session_id: str) -> None:
-        """处理 tool_call arguments 的 JSON 解析错误。
-
-        把错误回填给 LLM 让它重发，避免崩整轮对话。
-        """
-        preview = raw_args if len(raw_args) <= 300 else raw_args[:150] + " ... " + raw_args[-150:]
-        _cprint(
-            f"\n{_DIM}[agent] tool args JSONDecodeError (tool={tool_name},"
-            f" finish_reason={result.finish_reason}, len={len(raw_args)}): {error}{_RST}\n"
-            f"{_DIM}raw: {preview}{_RST}"
-        )
-        err_msg = (
-            f"ERROR: tool arguments JSON malformed or truncated "
-            f"(JSONDecodeError: {error}). The previous arguments were not valid JSON; "
-            f"please re-issue the tool call with shorter / well-formed arguments."
-        )
-        err_result_msg = self.provider.build_tool_result_message(
-            tool_call_id=tc["id"], result=err_msg,
-        )
-        err_result_msg["_token_count"] = len(err_msg) // 4
-        err_result_msg["tool_name"] = tool_name
-        messages.append(err_result_msg)
-        working_history.append(err_result_msg)
-
+    def _append_runtime_status(self, content: str, finish_reason: str,
+                               messages: list[dict], working_history: list[dict],
+                               session_id: str | None,
+                               agent_run_id: str | None = None):
+        """用普通 assistant 状态消息闭合失败或中断的历史边界。"""
+        status_msg = {
+            "role": "assistant",
+            "content": content,
+            "finish_reason": finish_reason,
+            "_msg_type": "runtime_status",
+        }
+        messages.append(status_msg)
+        working_history.append(status_msg)
         if self.db and session_id:
             self.db.append_message(
-                session_id, role="tool", content=err_msg,
-                tool_call_id=tc["id"], tool_name=tool_name,
-                token_count=len(err_msg) // 4,
+                session_id,
+                role="assistant",
+                content=content,
+                finish_reason=finish_reason,
+                msg_type="runtime_status",
+                agent_run_id=agent_run_id,
             )
-        if renderer:
-            renderer.on_tool_result(tool_name, err_msg)
 
     _MAX_SNAPSHOT_LINES = 20
     _MAX_SNAPSHOT_LINE_CHARS = 2000
@@ -317,6 +522,7 @@ class Agent:
         history: list[dict],
         renderer: Optional[StreamRenderer] = None,
         session_id: Optional[str] = None,
+        run_context=None,
     ) -> ConversationResult:
         """
         执行一次完整的对话轮次。agent运行的核心方法
@@ -332,6 +538,18 @@ class Agent:
         """
         compressed = False
         self._interrupt_requested = False
+        self._ctx.start_run()
+        agent_run_id = getattr(run_context, "run_id", None)
+
+        def cancel_requested() -> bool:
+            if self._interrupt_requested:
+                return True
+            if not run_context:
+                return False
+            if hasattr(run_context, "is_cancelled"):
+                return run_context.is_cancelled()
+            return bool(getattr(run_context, "cancel_event", None)
+                        and run_context.cancel_event.is_set())
 
         # 构建 API 所需的完整 messages（system + history + 本轮用户消息）
         messages = [{"role": "system", "content": self.system_prompt}]
@@ -345,25 +563,41 @@ class Agent:
         # 实时写入 user 消息
         if self.db and session_id:
             self.db.append_message(session_id, "user", user_message,
-                                   token_count=len(user_message) // 4)
+                                   token_count=len(user_message) // 4,
+                                   agent_run_id=agent_run_id)
 
         final_response = ""
         final_reasoning = ""
+        completion_reason = "completed"
+        prompt_tokens = 0
+        completion_tokens = 0
+        reasoning_tokens = 0
 
         # ══ 主循环 ══════════════════════════════════════════════════════════
         while True:
-            if self._interrupt_requested:
-                # 早期中断（流式响应之前）：写入占位 assistant 消息，
-                # 避免 DB 中出现孤立 user 消息导致下次连续 user 异常
-                if self.db and session_id:
-                    self.db.append_message(
-                        session_id, role="assistant", content="[Interrupted before response]",
-                        finish_reason="interrupted_before_response",
-                    )
+            if cancel_requested():
+                self._append_runtime_status(
+                    "[Interrupted before response]",
+                    "interrupted_before_response",
+                    messages,
+                    working_history,
+                    session_id,
+                    agent_run_id,
+                )
+                completion_reason = "user_interrupt"
                 break
             # 检查最大轮数的预算
             if not self._ctx.consume_budget():
                 print_budget_warning(self._ctx.budget_used, self.max_iterations)
+                self._append_runtime_status(
+                    "[Agent stopped: iteration budget exhausted]",
+                    "budget_exhausted",
+                    messages,
+                    working_history,
+                    session_id,
+                    agent_run_id,
+                )
+                completion_reason = "budget_exhausted"
                 break
 
             # ── 检查点 1：调 LLM 前，估算 token 是否超限 ────────────────────
@@ -373,31 +607,138 @@ class Agent:
                 self._ctx.force_compress = False
                 _cprint(f"\n{_DIM}⟳ compacting context...{_RST}")
                 working_history, new_sid = self._compressor.compress(
-                    working_history, self.db, session_id
+                    working_history, self.db, session_id,
+                    agent_run_id=agent_run_id,
+                    run_context=run_context,
                 )
                 if new_sid != session_id:
                     session_id = new_sid
                 messages = [{"role": "system", "content": self.system_prompt}] + working_history
                 self._ctx.reset_token_tracking()
                 compressed = True
+                if cancel_requested():
+                    self._append_runtime_status(
+                        "[Run stopped after context compression]",
+                        "interrupted_after_compression",
+                        messages,
+                        working_history,
+                        session_id,
+                        agent_run_id,
+                    )
+                    completion_reason = (
+                        run_context.abort_reason()
+                        if run_context and hasattr(run_context, "abort_reason")
+                        else "user_interrupt"
+                    ) or "user_interrupt"
+                    break
 
             if renderer:
                 renderer.reset()
 
             # 调用 LLM（流式）
-            result: StreamResult = self.provider.stream(
-                messages=messages,
-                tools=self._get_tool_schemas(),
-                on_delta=renderer.on_delta if renderer else None,
-                on_thinking=renderer.on_thinking if renderer else None,
-                on_tool_start=renderer.on_tool_start if renderer else None,
-                interrupt_check=lambda: self._interrupt_requested,
-                renderer=renderer,
-            )
+            attempts_before = getattr(run_context, "provider_attempts", 0)
+            try:
+                result: StreamResult = self.provider.stream(
+                    messages=messages,
+                    tools=self._get_tool_schemas(),
+                    on_delta=renderer.on_delta if renderer else None,
+                    on_thinking=renderer.on_thinking if renderer else None,
+                    on_tool_start=renderer.on_tool_start if renderer else None,
+                    interrupt_check=cancel_requested,
+                    renderer=renderer,
+                    run_context=run_context,
+                )
+            except KeyboardInterrupt:
+                if (
+                    run_context
+                    and getattr(run_context, "provider_attempts", 0) == attempts_before
+                ):
+                    run_context.record_provider_attempt()
+                self._append_runtime_status(
+                    "[Interrupted before response completed]",
+                    "interrupted",
+                    messages,
+                    working_history,
+                    session_id,
+                    agent_run_id,
+                )
+                completion_reason = (
+                    run_context.abort_reason()
+                    if run_context and hasattr(run_context, "abort_reason")
+                    else None
+                ) or "user_interrupt"
+                break
+            except Exception as exc:
+                if (
+                    run_context
+                    and getattr(run_context, "provider_attempts", 0) == attempts_before
+                ):
+                    run_context.record_provider_attempt()
+                if cancel_requested():
+                    completion_reason = (
+                        run_context.abort_reason()
+                        if run_context and hasattr(run_context, "abort_reason")
+                        else None
+                    ) or "user_interrupt"
+                    self._append_runtime_status(
+                        "[Agent run stopped before a response was completed]",
+                        "run_controlled_stop",
+                        messages,
+                        working_history,
+                        session_id,
+                        agent_run_id,
+                    )
+                    break
+                self._append_runtime_status(
+                    "[Agent run failed before a response was completed]",
+                    "provider_error",
+                    messages,
+                    working_history,
+                    session_id,
+                    agent_run_id,
+                )
+                partial = ConversationResult(
+                    final_response=final_response,
+                    reasoning=final_reasoning,
+                    messages=working_history,
+                    session_id=session_id,
+                    compressed=compressed,
+                    completion_reason="provider_error",
+                    iterations_used=self._ctx.budget_used,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                )
+                raise AgentRunAborted(
+                    error_code="provider_error",
+                    safe_message=f"{type(exc).__name__}: {exc}",
+                    partial_result=partial,
+                    completion_reason="provider_error",
+                ) from exc
+
+            if (
+                run_context
+                and getattr(run_context, "provider_attempts", 0) == attempts_before
+            ):
+                # 测试 Provider 或第三方兼容 Provider 可能尚未接入 attempt 记账。
+                run_context.record_provider_attempt()
 
             # 渲染器收尾
             if renderer:
                 renderer.finalize()
+
+            prompt_tokens += int(result.prompt_tokens or 0)
+            completion_tokens += int(result.completion_tokens or 0)
+            result_reasoning_tokens = int(
+                getattr(result, "reasoning_tokens", 0) or 0
+            )
+            reasoning_tokens += result_reasoning_tokens
+            if run_context:
+                run_context.record_provider_usage(
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
+                    reasoning_tokens=result_reasoning_tokens,
+                )
 
             # ── 中断处理：Ctrl+C 终止了流式输出 ────────────────────────────
             if result.interrupted:
@@ -408,8 +749,14 @@ class Agent:
                     self.db.append_message(
                         session_id, role="assistant", content=result.content,
                         finish_reason="interrupted",
+                        agent_run_id=agent_run_id,
                     )
                 final_response = result.content or ""
+                completion_reason = (
+                    run_context.abort_reason()
+                    if run_context and hasattr(run_context, "abort_reason")
+                    else None
+                ) or "user_interrupt"
                 break
 
             # ── 检查点 2：用真实 usage 更新 token 追踪 ──────────────────────
@@ -431,6 +778,7 @@ class Agent:
                     reasoning=result.reasoning or None,
                     token_count=result.completion_tokens,
                     finish_reason=result.finish_reason,
+                    agent_run_id=agent_run_id,
                 )
 
             final_reasoning = result.reasoning
@@ -442,16 +790,119 @@ class Agent:
             # ── 无工具调用：最终回复，退出循环 ────────────────────────────
             if not result.has_tool_calls:
                 final_response = result.content
+                completion_reason = result.finish_reason or "completed"
                 break
 
-            # ── 有工具调用：逐个处理 ──────────────────────────────
-            for tc in result.tool_calls:
-                if self._interrupt_requested:
-                    break
-                self._process_tool_call(
-                    tc, result, messages, working_history,
-                    renderer, session_id,
+            # ── 有工具调用：纯 Delegate 批次可受控并行，混合调用保持串行 ──
+            delegate_batch_results = None
+            if all(
+                tc.get("function", {}).get("name") == "delegate_task"
+                for tc in result.tool_calls
+            ):
+                delegate_batch_results = self._run_delegate_batch(
+                    result.tool_calls, run_context, session_id
                 )
+
+            cancelled_during_tools = False
+            controlled_stop_reason = "user_interrupt"
+            previous_delegate_batch = self._delegate_batch_results
+            self._delegate_batch_results = delegate_batch_results
+            try:
+                for index, tc in enumerate(result.tool_calls):
+                    if cancel_requested():
+                        cancelled_during_tools = True
+                        for pending in result.tool_calls[index:]:
+                            self._append_tool_result(
+                                pending,
+                                pending["function"]["name"],
+                                "CANCELLED: Agent run was interrupted before this tool started.",
+                                messages,
+                                working_history,
+                                renderer,
+                                session_id,
+                                agent_run_id,
+                            )
+                        break
+                    try:
+                        self._process_tool_call(
+                            tc, result, messages, working_history,
+                            renderer, session_id, agent_run_id, run_context,
+                        )
+                    except Exception as exc:
+                        if getattr(exc, "is_run_control", False):
+                            controlled_stop_reason = getattr(
+                                exc, "completion_reason", "user_interrupt"
+                            )
+                            cancelled_during_tools = True
+                            message = (
+                                "TIMED_OUT: Agent run deadline was reached before this tool started."
+                                if controlled_stop_reason == "deadline_exceeded"
+                                else "CANCELLED: Agent run was interrupted before this tool started."
+                            )
+                            for pending in result.tool_calls[index:]:
+                                self._append_tool_result(
+                                    pending,
+                                    pending["function"]["name"],
+                                    message,
+                                    messages,
+                                    working_history,
+                                    renderer,
+                                    session_id,
+                                    agent_run_id,
+                                )
+                            break
+                        for pending_index, pending in enumerate(result.tool_calls[index:]):
+                            prefix = "FAILED" if pending_index == 0 else "CANCELLED"
+                            self._append_tool_result(
+                                pending,
+                                pending["function"]["name"],
+                                f"{prefix}: Agent run aborted during tool processing.",
+                                messages,
+                                working_history,
+                                renderer,
+                                session_id,
+                                agent_run_id,
+                            )
+                        self._append_runtime_status(
+                            "[Agent run failed during tool processing]",
+                            "tool_internal_error",
+                            messages,
+                            working_history,
+                            session_id,
+                            agent_run_id,
+                        )
+                        partial = ConversationResult(
+                            final_response=final_response,
+                            reasoning=final_reasoning,
+                            messages=working_history,
+                            session_id=session_id,
+                            compressed=compressed,
+                            completion_reason="tool_internal_error",
+                            iterations_used=self._ctx.budget_used,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            reasoning_tokens=reasoning_tokens,
+                        )
+                        raise AgentRunAborted(
+                            error_code="tool_internal_error",
+                            safe_message=f"{type(exc).__name__}: {exc}",
+                            partial_result=partial,
+                            completion_reason="tool_internal_error",
+                        ) from exc
+            finally:
+                self._delegate_batch_results = previous_delegate_batch
+
+            if cancelled_during_tools:
+                self._append_runtime_status(
+                    "[Interrupted during tool execution]",
+                    "interrupted",
+                    messages,
+                    working_history,
+                    session_id,
+                    agent_run_id,
+                )
+                completion_reason = controlled_stop_reason
+                break
 
         return ConversationResult(
             final_response=final_response,
@@ -459,4 +910,9 @@ class Agent:
             messages=working_history,
             session_id=session_id,
             compressed=compressed,
+            completion_reason=completion_reason,
+            iterations_used=self._ctx.budget_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            reasoning_tokens=reasoning_tokens,
         )

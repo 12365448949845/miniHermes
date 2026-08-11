@@ -14,7 +14,6 @@ Curator 维护服务：定期整理技能库。
 import json
 import logging
 import shutil
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -162,19 +161,7 @@ def lifecycle_transitions() -> dict:
     return stats
 
 
-def consolidate(provider) -> Optional[str]:
-    """
-    Phase 2：LLM 驱动的技能合并（当 agent-created 技能 >= 5 个时触发）。
-
-    Returns:
-        合并 agent 的输出摘要，或 None（未触发）。
-    """
-    from agent.agent import Agent
-
-    skills = _get_agent_created_skills()
-    if len(skills) < 5:
-        return None
-
+def _consolidation_prompt(skills: list[dict]) -> str:
     skill_list = "\n".join(
         f"- {s['name']}: {s['description']} [uses={s['total_uses']}, status={s['status']}]"
         for s in skills
@@ -186,34 +173,15 @@ def consolidate(provider) -> Optional[str]:
         "into broader class-level umbrellas.\n\n"
         "Current skills:\n"
         f"{skill_list}\n\n"
-        "Actions you can take:\n"
-        "1. Merge 2+ narrow skills into one broader umbrella (archive the narrow ones, create the umbrella)\n"
-        "2. Patch an existing skill to absorb content from another\n"
-        "3. Do nothing if the library is already well-organized\n\n"
+        "Produce a consolidation proposal only. You may inspect skills and list usage, "
+        "but you must not create, edit, patch, archive, restore, or write files.\n"
+        "The proposal may recommend merging narrow skills, expanding an existing skill, "
+        "or doing nothing when the library is already well organized.\n\n"
         "Be conservative — only merge skills that clearly overlap. "
         "Prefer fewer high-quality skills over many narrow ones."
     )
 
-    try:
-        agent = Agent(
-            provider=provider,
-            db=None,
-            clarify_callback=None,
-            auto_approve=True,
-            tool_filter={"include": {"skill_manage", "skill_view", "read_file"}},
-            system_prompt_override=prompt,
-            max_iterations_override=10,
-        )
-        result = agent.run_conversation(
-            user_message="Review the skill library and consolidate if appropriate.",
-            history=[],
-            renderer=None,
-            session_id=None,
-        )
-        return result.final_response
-    except Exception as e:
-        logger.debug(f"Curator consolidation error (non-fatal): {e}")
-        return None
+    return prompt
 
 
 def should_run_curator() -> bool:
@@ -234,13 +202,8 @@ def should_run_curator() -> bool:
 
 
 def run_curator(provider=None):
-    """执行完整的 curator 运行（Phase 1 + Phase 2）。"""
+    """兼容的确定性整理入口；LLM consolidation 必须交由 Runtime。"""
     stats = lifecycle_transitions()
-
-    consolidation_result = None
-    if provider:
-        consolidation_result = consolidate(provider)
-
     state = _load_state()
     state["last_run_at"] = _now_ts()
     state["run_count"] = state.get("run_count", 0) + 1
@@ -254,16 +217,52 @@ def run_curator(provider=None):
     return stats
 
 
-def maybe_run_curator(provider=None):
-    """非阻塞：如果满足条件，在后台线程中运行 curator。"""
+def _prepare_curator_run(run_context):
+    """在已登记的 curator Run 内执行确定性整理，并按需准备 LLM 复盘。"""
+    stats = lifecycle_transitions()
+    state = _load_state()
+    state["last_run_at"] = _now_ts()
+    state["run_count"] = state.get("run_count", 0) + 1
+    state["last_stats"] = stats
+    _save_state(state)
+
+    skills = _get_agent_created_skills()
+    if len(skills) < 5:
+        return None
+    return {
+        "system_prompt": _consolidation_prompt(skills),
+        "user_message": "Review the skill library and return a consolidation proposal.",
+    }
+
+
+def maybe_run_curator(
+    runtime,
+    *,
+    conversation_id: str | None = None,
+    session_id: str | None = None,
+    model: str = "",
+):
+    """满足周期条件时提交低优先级 curator Run，不直接创建线程或 Agent。"""
     if not should_run_curator():
-        return
+        return None
+    from agent.runtime import AgentSpec
+    from approval import ApprovalMode
 
-    def _run():
-        try:
-            run_curator(provider)
-        except Exception as e:
-            logger.debug(f"Curator error (non-fatal): {e}")
-
-    t = threading.Thread(target=_run, daemon=True, name="curator")
-    t.start()
+    return runtime.submit_background(
+        spec=AgentSpec(
+            kind="curator",
+            tool_policy={"include": {"skill_manage", "skill_view", "read_file"}},
+            approval_mode=ApprovalMode.DENY_SENSITIVE,
+            max_iterations=10,
+            persist_messages=False,
+            background=True,
+        ),
+        request={
+            "task": "Maintain the agent-created skill library.",
+            "user_message": "Perform scheduled skill maintenance.",
+            "model": model,
+        },
+        conversation_id=conversation_id,
+        session_id=session_id,
+        prepare=_prepare_curator_run,
+    )

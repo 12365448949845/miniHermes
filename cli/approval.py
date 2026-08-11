@@ -92,8 +92,10 @@ def build_approval_widget(state: AppState):
 def make_approval_callback(state: AppState):
     """工厂函数：生成传给 Agent 的 approval 回调（替代 tools/approval.py 的 radiolist）。"""
 
-    def _approval_callback(tool_name: str, args: dict, description: str) -> str:
+    def _approval_callback(tool_name: str, args: dict, description: str,
+                           run_context=None) -> str:
         response_queue: Queue = Queue()
+        run_id = getattr(run_context, "run_id", None)
 
         if tool_name == "bash":
             detail = args.get("command", "")
@@ -105,20 +107,31 @@ def make_approval_callback(state: AppState):
             "detail": detail,
             "selected": 0,
             "response_queue": response_queue,
+            "run_id": run_id,
         }
         state.invalidate()
 
         while not state.should_exit:
+            if run_context and hasattr(run_context, "raise_if_aborted"):
+                try:
+                    run_context.raise_if_aborted()
+                except Exception:
+                    state.clear_approval(run_id)
+                    state.invalidate()
+                    raise
             try:
-                response = response_queue.get(timeout=1)
-                state.clear_approval()
+                response = response_queue.get(timeout=0.1)
+                state.clear_approval(run_id)
                 state.invalidate()
                 return response
             except Empty:
                 state.invalidate()
 
-        state.clear_approval()
+        state.clear_approval(run_id)
         state.invalidate()
+        if run_context is not None:
+            from agent.runtime import AgentRunCancelled
+            raise AgentRunCancelled("shutdown", "Approval wait cancelled during shutdown")
         return "deny"
 
     return _approval_callback

@@ -1,86 +1,29 @@
-# generate_image — AI 文生图
+# generate_image - AI 文生图
 
-代码: `tools/image_gen.py` (126行)
+代码位置：`tools/image_gen.py`
 
----
+`generate_image` 通过 Pollinations.ai 将文字提示词转为图片，将返回的图片保存到当前项目的 `image_tmp/` 目录，并按配置决定是否自动打开。
 
-## 概述
+主 Agent 使用的是 DeepSeek 聊天模型；图片生成是一项独立的外部服务。此工具不会使用、不会读取、也不会修改 DeepSeek 的 `model` 配置。
 
-通过免费 AI 图像生成 API 将文本描述转换为图片。无需 API key。
+## 配置
 
-## Schema 设计
+默认配置如下：
 
-```python
-{
-    "name": "generate_image",
-    "parameters": {
-        "prompt": {"type": "string", "description": "Image description."},
-        "width": {"type": "integer", "default": 1024},
-        "height": {"type": "integer", "default": 1024}
-    },
-    "required": ["prompt"]
-}
+```yaml
+image_generation:
+  # 留空时使用 https://image.pollinations.ai/prompt/
+  base_url: ""
+  timeout_seconds: 120
+  auto_open: true
 ```
 
-## 实现
+可以在 `~/.minihermes/config.yaml` 中修改此配置。`base_url` 只用于替换 Pollinations 服务的访问地址，不包含 API Key、聊天模型或中转站配置。
 
-```python
-_BASE_URL = "https://image.pollinations.ai/prompt/"
-_REQUEST_TIMEOUT = 120
+## 常见错误
 
-def generate_image(prompt: str, width: int = 1024, height: int = 1024) -> str:
-    width = max(64, min(width, 2048))     # clamp 64-2048
-    height = max(64, min(height, 2048))
+- `TLS connection failed`：网络在 TLS 握手阶段中断，或证书无法验证。检查该图片服务在当前网络下是否可达；不要通过关闭证书验证来绕过问题。
+- `service is unreachable`：当前网络无法连接到 Pollinations 的域名或端口。
+- `HTTP 429/5xx`：服务端限流或临时故障，稍后再由用户发起一次新请求。
 
-    url = f"{_BASE_URL}{urllib.parse.quote(prompt)}?width={width}&height={height}"
-    resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
-
-    if "image" not in resp.headers.get("content-type", ""):
-        return f"Error: API returned non-image response."
-
-    # 保存到 image_tmp/<timestamp_ms>.jpeg
-    out_dir = Path(_OUTPUT_SUBDIR)
-    out_dir.mkdir(exist_ok=True)
-    filename = f"{int(time.time() * 1000)}.jpeg"
-    filepath = out_dir / filename
-    filepath.write_bytes(resp.content)
-
-    # 自动打开
-    viewer_msg = _open_in_default_viewer(filepath)
-
-    return f"Image generated: {filepath}\n{viewer_msg}"
-```
-
-## 关键设计点
-
-### 免费 API
-
-使用公开免费 API，无认证开销。
-
-### 尺寸限制
-
-64-2048 像素，两端 clamp。
-
-### 中文 prompt 支持
-
-通过 `urllib.parse.quote` URL 编码，支持中文描述。
-
-### 自动打开
-
-```python
-def _open_in_default_viewer(path):
-    if sys.platform == "darwin":
-        subprocess.run(["open", str(path)])
-    elif sys.platform == "win32":
-        os.startfile(str(path))
-    else:
-        subprocess.run(["xdg-open", str(path)])
-```
-
-### 错误检测
-
-通过 `content-type` 检查响应是否为图片，而非 JSON 状态码。
-
-### 文件命名
-
-毫秒时间戳 + `.jpeg`：`1700000000123.jpeg`。简单去重，无需随机数。
+这些错误会直接返回给 Agent，并要求它不要在同一轮对完全相同的请求盲目重试。

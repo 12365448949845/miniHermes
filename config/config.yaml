@@ -16,7 +16,25 @@ code_execution:
   # 七牛云 E2B 兼容沙箱 API Key
   api_key: ""
 
+image_generation:
+  # Pollinations 免费图片服务的可选基础地址；留空使用默认地址。
+  base_url: ""
+  timeout_seconds: 120
+  auto_open: true
+
 evolution:
   # 自动进化系统总开关（记忆复盘 / 技能复盘 / Curator 维护）
   enabled: true
 
+agent_runtime:
+  cancel_grace_seconds: 3
+  # Delegate 并发默认关闭。提高此值前，子 Agent 必须只申请并行安全的只读工具。
+  max_concurrency: 1
+  delegate_batch_timeout_seconds: 300
+  run_timeout_seconds:
+    main_turn: null
+    delegate: 300
+    plan: 600
+    memory_nudge: 120
+    skill_nudge: 180
+    curator: 300

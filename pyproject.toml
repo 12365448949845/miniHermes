@@ -30,7 +30,27 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["minihermes_cli"]
+packages = [
+    "minihermes_cli",
+    "agent",
+    "approval",
+    "cli",
+    "config",
+    "context",
+    "evolution",
+    "prompt",
+    "provider",
+    "renderer",
+    "session",
+    "skills",
+    "tools",
+]
+# 可编辑安装和发布 wheel 都直接使用真实源码，不依赖构建时生成的 app/ 目录。
+
+[tool.hatch.build.targets.wheel.force-include]
+"main.py" = "main.py"
+"config/config.yaml" = "config/config.yaml"
+"_builtin_skills" = "_builtin_skills"
 
 [tool.uv]
 managed = true

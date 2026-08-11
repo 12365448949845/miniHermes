@@ -42,7 +42,8 @@ _MAX_CHOICES = 4
         },
     },
 })
-def clarify(question: str, choices: list = None, callback=None) -> str:
+def clarify(question: str, choices: list = None, callback=None,
+            run_context=None) -> str:
     """
     向用户提问并返回回答 JSON。
 
@@ -69,8 +70,21 @@ def clarify(question: str, choices: list = None, callback=None) -> str:
         )
 
     try:
-        response = callback(question, normalized_choices)
+        try:
+            response = callback(
+                question,
+                normalized_choices,
+                run_context=run_context,
+            )
+        except TypeError as exc:
+            # 兼容旧的第三方 callback(question, choices) 签名；只有
+            # 参数不被接受时才回退，callback 内部的 TypeError 继续抛出。
+            if "run_context" not in str(exc):
+                raise
+            response = callback(question, normalized_choices)
     except Exception as exc:
+        if getattr(exc, "is_run_control", False):
+            raise
         return json.dumps(
             {"error": f"Failed to get user input: {exc}"},
             ensure_ascii=False,

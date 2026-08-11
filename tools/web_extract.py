@@ -31,14 +31,18 @@ _MAX_CONTENT = 50000
         },
     },
 })
-def web_extract(url: str) -> str:
+def web_extract(url: str, _timeout: float | None = None,
+                _cancel_check=None) -> str:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
+    if _cancel_check and _cancel_check():
+        return "Error: request cancelled before start"
+    timeout = max(0.1, min(15.0, float(_timeout))) if _timeout else 15.0
     try:
         resp = requests.get(
             url,
-            timeout=15,
+            timeout=timeout,
             headers={"User-Agent": "Mozilla/5.0 (compatible; MiniHermes/1.0)"},
             allow_redirects=True,
         )
@@ -49,6 +53,9 @@ def web_extract(url: str) -> str:
         return f"Error: HTTP {e.response.status_code} for {url}"
     except requests.RequestException as e:
         return f"Error: {e}"
+
+    if _cancel_check and _cancel_check():
+        return "Error: request cancelled before completion"
 
     content_type = resp.headers.get("content-type", "")
     if "text/html" not in content_type and "text/plain" not in content_type:

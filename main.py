@@ -16,6 +16,8 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 
 from agent.agent import Agent
+from agent.runtime import AgentRuntimeManager, AgentSpec
+from approval import ApprovalEngine, ApprovalMode
 from provider import Provider
 from renderer import StreamRenderer, print_welcome, print_error
 from session import SessionDB
@@ -75,17 +77,56 @@ def main():
         status_text=f" ⚕ {model_name[:26]}",
     )
 
-    # 初始化 Agent（需要 clarify/approval callback）
+    # 初始化主 Agent 工厂（/clear、/resume 会通过 Runtime 重建实例）
     clarify_callback = make_clarify_callback(state)
     approval_callback = make_approval_callback(state)
+    approval_engine = ApprovalEngine()
+
+    runtime = None
+
+    def create_main_agent():
+        return Agent(
+            provider,
+            db=db,
+            clarify_callback=clarify_callback,
+            approval_callback=approval_callback,
+            approval_mode=ApprovalMode.INTERACTIVE,
+            approval_engine=approval_engine,
+            agent_kind="main_turn",
+            tool_db=db,
+            runtime=runtime,
+        )
+
+    def create_ephemeral_agent(spec: AgentSpec, request: dict, run_context):
+        """Runtime 的唯一临时 Agent 工厂；临时运行默认不写主会话消息。"""
+        return Agent(
+            provider,
+            db=db if spec.persist_messages else None,
+            clarify_callback=clarify_callback,
+            approval_callback=approval_callback,
+            tool_policy=spec.tool_policy,
+            agent_kind=spec.kind,
+            approval_mode=spec.approval_mode,
+            approval_engine=approval_engine,
+            tool_db=db,
+            system_prompt_override=spec.system_prompt or None,
+            max_iterations_override=spec.max_iterations,
+            runtime=None,
+        )
+
     try:
-        agent = Agent(provider, db=db, clarify_callback=clarify_callback,
-                      approval_callback=approval_callback)
+        runtime = AgentRuntimeManager(
+            db,
+            agent_factory=create_main_agent,
+            ephemeral_factory=create_ephemeral_agent,
+        )
+        agent = create_main_agent()
     except Exception as e:
         print_error(f"Failed to initialize: {e}")
         sys.exit(1)
 
     state.agent = agent
+    state.runtime = runtime
 
     # 创建 Session
     session_id = generate_session_id()
@@ -95,6 +136,8 @@ def main():
         model_config=json.dumps(cfg.get_model_config(), ensure_ascii=False),
         system_prompt=agent.system_prompt,
     )
+    handle = runtime.open_session(session_id, agent=agent)
+    state.conversation_id = handle.conversation_id
 
     # 打印欢迎信息
     import tools as tool_registry
@@ -128,8 +171,9 @@ def main():
         pass
     finally:
         state.should_exit = True
+        runtime.shutdown()
         state.input_queue.put(None)
-        db.end_session(session_id, end_reason="user_exit")
+        db.end_session(state.session_id, end_reason="user_exit")
         print("\nBye!")
 
 

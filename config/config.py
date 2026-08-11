@@ -9,6 +9,7 @@
 """
 
 import sys
+import copy
 import yaml
 from pathlib import Path
 
@@ -27,28 +28,43 @@ def _ensure_config():
         sys.exit(0)
 
 
-def load() -> dict:
-    _ensure_config()
-    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-        user_cfg = yaml.safe_load(f) or {}
+def _fill_missing(default, user):
+    """递归补齐缺失项；用户标量、列表和已有字典值优先。"""
+    if not isinstance(default, dict) or not isinstance(user, dict):
+        return copy.deepcopy(user)
+    merged = copy.deepcopy(user)
+    for key, value in default.items():
+        if key not in merged:
+            merged[key] = copy.deepcopy(value)
+        elif isinstance(value, dict) and isinstance(merged[key], dict):
+            merged[key] = _fill_missing(value, merged[key])
+    return merged
 
-    mutated = False
+
+def _load_from_path(path: Path, *, persist_missing: bool = False) -> dict:
+    if path == _CONFIG_PATH:
+        _ensure_config()
+    with open(path, "r", encoding="utf-8") as f:
+        user_cfg = yaml.safe_load(f) or {}
+    if not isinstance(user_cfg, dict):
+        user_cfg = {}
+
+    default_cfg = {}
     if DEFAULT_CONFIG_PATH.exists():
         with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
             default_cfg = yaml.safe_load(f) or {}
-        for key, value in default_cfg.items():
-            if key not in user_cfg:
-                user_cfg[key] = value
-                mutated = True
-
-    if mutated:
+    merged = _fill_missing(default_cfg, user_cfg)
+    if persist_missing and merged != user_cfg:
         try:
-            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-                yaml.safe_dump(user_cfg, f, allow_unicode=True, sort_keys=False)
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(merged, f, allow_unicode=True, sort_keys=False)
         except OSError:
             pass
+    return merged
 
-    return user_cfg
+
+def load() -> dict:
+    return _load_from_path(_CONFIG_PATH, persist_missing=True)
 
 
 _cfg = load()
@@ -71,7 +87,10 @@ class Config:
         """延迟加载：首次访问时从磁盘读取并合并默认值。"""
         if self._data is not None:
             return
-        self._data = load()
+        self._data = _load_from_path(
+            self._config_path,
+            persist_missing=self._config_path == _CONFIG_PATH,
+        )
 
     @property
     def model(self) -> dict:
@@ -87,15 +106,27 @@ class Config:
 
     @property
     def code_execution(self) -> dict:
-        """代码执行沙箱配置。"""
+        """Code execution sandbox settings."""
         self._ensure_loaded()
         return self._data.get("code_execution", {})
+
+    @property
+    def image_generation(self) -> dict:
+        """Pollinations image-generation settings."""
+        self._ensure_loaded()
+        return self._data.get("image_generation", {})
 
     @property
     def evolution(self) -> dict:
         """进化系统配置。"""
         self._ensure_loaded()
         return self._data.get("evolution", {})
+
+    @property
+    def agent_runtime(self) -> dict:
+        """Agent Runtime 的取消宽限期和各类 Run deadline。"""
+        self._ensure_loaded()
+        return _normalize_agent_runtime(self._data.get("agent_runtime", {}))
 
     def reload(self):
         """强制从磁盘重新加载（运行时配置变更后调用）。"""
@@ -118,7 +149,56 @@ def get_code_execution_config() -> dict:
     return _default_config.code_execution
 
 
+def get_image_generation_config() -> dict:
+    return _default_config.image_generation
+
+
 def get_evolution_config() -> dict:
     return _default_config.evolution
 
 
+def _normalize_agent_runtime(raw: dict | None) -> dict:
+    defaults = {
+        "cancel_grace_seconds": 3.0,
+        # Delegate 并发必须显式开启；1 保持现有的严格串行行为。
+        "max_concurrency": 1,
+        "delegate_batch_timeout_seconds": 300.0,
+        "run_timeout_seconds": {
+            "main_turn": None,
+            "delegate": 300.0,
+            "plan": 600.0,
+            "memory_nudge": 120.0,
+            "skill_nudge": 180.0,
+            "curator": 300.0,
+        },
+    }
+    value = _fill_missing(defaults, raw if isinstance(raw, dict) else {})
+    try:
+        grace = float(value.get("cancel_grace_seconds", 3.0))
+        value["cancel_grace_seconds"] = min(max(grace, 0.1), 60.0)
+    except (TypeError, ValueError):
+        value["cancel_grace_seconds"] = 3.0
+    try:
+        value["max_concurrency"] = min(
+            max(int(value.get("max_concurrency", 1)), 1), 16
+        )
+    except (TypeError, ValueError):
+        value["max_concurrency"] = 1
+    try:
+        timeout = float(value.get("delegate_batch_timeout_seconds", 300.0))
+        value["delegate_batch_timeout_seconds"] = min(max(timeout, 1.0), 3600.0)
+    except (TypeError, ValueError):
+        value["delegate_batch_timeout_seconds"] = 300.0
+    for kind, timeout in value.get("run_timeout_seconds", {}).items():
+        if timeout is None:
+            continue
+        try:
+            timeout = float(timeout)
+            value["run_timeout_seconds"][kind] = timeout if timeout > 0 else None
+        except (TypeError, ValueError):
+            value["run_timeout_seconds"][kind] = defaults["run_timeout_seconds"].get(kind)
+    return value
+
+
+def get_agent_runtime_config() -> dict:
+    return _default_config.agent_runtime

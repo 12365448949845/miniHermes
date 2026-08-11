@@ -139,41 +139,50 @@ def reset_session():
 
 # ── 检查函数 ─────────────────────────────────────────────────────────────────
 
-def _check_command(command: str) -> tuple[str, Optional[str], Optional[str]]:
+def _check_command(
+    command: str,
+    approved: set[str] | None = None,
+) -> tuple[str, Optional[str], Optional[str]]:
     """
     检查 bash 命令安全性。
     返回: (action, pattern_key, description)
       action: "allow" | "block" | "confirm"
     """
+    approved = _session_approved if approved is None else approved
     for pattern, desc in HARDLINE_PATTERNS:
         if pattern.search(command):
             return ("block", None, desc)
 
     for pattern, key, desc in DANGEROUS_PATTERNS:
         if pattern.search(command):
-            if key in _session_approved:
+            if key in approved:
                 return ("allow", key, None)
             return ("confirm", key, desc)
 
     return ("allow", None, None)
 
 
-def _check_write_file(path: str, content: str) -> tuple[str, Optional[str], Optional[str]]:
+def _check_write_file(
+    path: str,
+    content: str,
+    approved: set[str] | None = None,
+) -> tuple[str, Optional[str], Optional[str]]:
     """
     检查 write_file 操作安全性。
     返回: (action, pattern_key, description)
       action: "allow" | "confirm"（write_file 无硬拦截）
     """
+    approved = _session_approved if approved is None else approved
     for pattern, key, desc in SENSITIVE_PATH_PATTERNS:
         if pattern.search(path):
-            if key in _session_approved:
+            if key in approved:
                 return ("allow", key, None)
             return ("confirm", key, desc)
 
     content_head = content[:2000]
     for pattern, key, desc in SENSITIVE_CONTENT_PATTERNS:
         if pattern.search(content_head):
-            if key in _session_approved:
+            if key in approved:
                 return ("allow", key, None)
             return ("confirm", key, desc)
 
