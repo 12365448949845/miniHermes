@@ -74,12 +74,42 @@ def _collect_terminated_output(process: subprocess.Popen) -> None:
 
 
 @register(_SCHEMA)
-def bash(command: str, timeout: float = 30, _cancel_check=None) -> str:
+def bash(
+    command: str,
+    timeout: float = 30,
+    _cancel_check=None,
+    _evidence_capture=None,
+    _working_directory: str | None = None,
+    _workspace_context=None,
+) -> str:
     process = None
     stdout_file = None
     stderr_file = None
+    termination_reason = "spawn_error"
+    exit_code = None
+    stdout = ""
+    stderr = ""
     try:
         timeout = max(0.01, float(timeout))
+        if _workspace_context is not None:
+            result = _workspace_context.execute_command(
+                command, timeout=timeout, cancel_check=_cancel_check
+            )
+            stdout = result.stdout
+            stderr = result.stderr
+            exit_code = result.exit_code
+            termination_reason = result.termination_reason
+            if result.error_code == "timeout":
+                return f"Error: command timed out after {timeout:g}s"
+            if result.error_code == "cancelled":
+                return "Error: command cancelled before completion"
+            if result.error_code:
+                detail = stderr.strip() or result.error_code
+                return f"Error: {result.error_code}: {detail}"
+            output = (stdout or "") + (stderr or "")
+            if exit_code not in (None, 0):
+                output += f"\n[exit code: {exit_code}]"
+            return _truncate_output(output.strip() or "(no output)")
         # 不用 PIPE：Windows 下孙进程会继承管道句柄，communicate() 即使
         # shell 已退出也可能等待到孙进程自然结束。
         stdout_file = tempfile.TemporaryFile(
@@ -94,6 +124,7 @@ def bash(command: str, timeout: float = 30, _cancel_check=None) -> str:
             stdout=stdout_file,
             stderr=stderr_file,
             text=True,
+            cwd=_working_directory or None,
             start_new_session=(os.name != "nt"),
             creationflags=(
                 subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -104,11 +135,13 @@ def bash(command: str, timeout: float = 30, _cancel_check=None) -> str:
             if _cancel_check and _cancel_check():
                 _terminate_process_tree(process)
                 _collect_terminated_output(process)
+                termination_reason = "cancelled"
                 return "Error: command cancelled before completion"
             remaining = timeout - (time.monotonic() - started)
             if remaining <= 0:
                 _terminate_process_tree(process)
                 _collect_terminated_output(process)
+                termination_reason = "timed_out"
                 return f"Error: command timed out after {timeout:g}s"
             try:
                 process.wait(timeout=min(0.1, remaining))
@@ -120,6 +153,8 @@ def bash(command: str, timeout: float = 30, _cancel_check=None) -> str:
         stderr_file.seek(0)
         stdout = stdout_file.read()
         stderr = stderr_file.read()
+        exit_code = process.returncode
+        termination_reason = "exited"
         output = ""
         if stdout:
             output += stdout
@@ -129,23 +164,46 @@ def bash(command: str, timeout: float = 30, _cancel_check=None) -> str:
             output += f"\n[exit code: {process.returncode}]"
         output = output.strip() or "(no output)"
 
-        if len(output) > _MAX_OUTPUT_CHARS:
-            head_chars = int(_MAX_OUTPUT_CHARS * 0.4)
-            tail_chars = _MAX_OUTPUT_CHARS - head_chars
-            omitted = len(output) - head_chars - tail_chars
-            output = (
-                output[:head_chars]
-                + f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted out of {len(output)} total] ...\n\n"
-                + output[-tail_chars:]
-            )
-
-        return output
+        return _truncate_output(output)
     except Exception as e:
         if process is not None:
             _terminate_process_tree(process)
+        stderr = f"{type(e).__name__}: {e}"
         return f"Error: {e}"
     finally:
+        if stdout_file is not None:
+            stdout_file.seek(0)
+            stdout = stdout or stdout_file.read()
+        if stderr_file is not None:
+            stderr_file.seek(0)
+            stderr = stderr or stderr_file.read()
+        if _evidence_capture is not None:
+            try:
+                _evidence_capture.complete(
+                    stdout=stdout,
+                    stderr=stderr,
+                    exit_code=exit_code,
+                    termination_reason=termination_reason,
+                )
+            except Exception as exc:
+                # 证据记录是旁路能力，绝不能改变 bash 的原始返回值。
+                reporter = getattr(_evidence_capture, "report_failure", None)
+                if reporter is not None:
+                    reporter("finalize", exc)
         if stdout_file is not None:
             stdout_file.close()
         if stderr_file is not None:
             stderr_file.close()
+
+
+def _truncate_output(output: str) -> str:
+    if len(output) <= _MAX_OUTPUT_CHARS:
+        return output
+    head_chars = int(_MAX_OUTPUT_CHARS * 0.4)
+    tail_chars = _MAX_OUTPUT_CHARS - head_chars
+    omitted = len(output) - head_chars - tail_chars
+    return (
+        output[:head_chars]
+        + f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted out of {len(output)} total] ...\n\n"
+        + output[-tail_chars:]
+    )

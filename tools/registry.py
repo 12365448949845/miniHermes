@@ -8,7 +8,7 @@ import json
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Callable, Mapping, Optional
@@ -36,6 +36,7 @@ class ToolExecutionResult:
     attempts: int = 0
     duration_seconds: float = 0.0
     side_effects_possible: bool = False
+    execution_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class ResolvedToolMetadata:
     approval: str
     retry: str
     concurrency_key: str | None = None
+    idempotency: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,7 @@ class ToolMetadata:
     approval: str | Callable[[dict], str] = "policy"
     retry: str | Callable[[dict], str] = "never"
     concurrency_key: str | Callable[[dict], str | None] | None = None
+    idempotency: str | Callable[[dict], str] = "unknown"
 
     def resolve(self, args: dict) -> ResolvedToolMetadata:
         def value(item):
@@ -62,6 +65,7 @@ class ToolMetadata:
             approval=value(self.approval),
             retry=value(self.retry),
             concurrency_key=value(self.concurrency_key),
+            idempotency=value(self.idempotency),
         )
 
 
@@ -256,11 +260,19 @@ def _skill_side_effect(args: dict) -> str:
 
 _DEFAULT_METADATA = {
     "bash": ToolMetadata(side_effect="unknown", retry="never"),
-    "read_file": ToolMetadata(side_effect="none", retry="never"),
+    "read_file": ToolMetadata(
+        side_effect="none", retry="never", idempotency="idempotent"
+    ),
     "write_file": ToolMetadata(side_effect="local", retry="never"),
-    "list_dir": ToolMetadata(side_effect="none", retry="never"),
-    "web_search": ToolMetadata(side_effect="none", retry="transient"),
-    "web_extract": ToolMetadata(side_effect="none", retry="transient"),
+    "list_dir": ToolMetadata(
+        side_effect="none", retry="never", idempotency="idempotent"
+    ),
+    "web_search": ToolMetadata(
+        side_effect="none", retry="transient", idempotency="idempotent"
+    ),
+    "web_extract": ToolMetadata(
+        side_effect="none", retry="transient", idempotency="idempotent"
+    ),
     "web_open": ToolMetadata(side_effect="external", retry="never"),
     "execute_code": ToolMetadata(side_effect="external", retry="never"),
     "process": ToolMetadata(side_effect="none", retry="never"),
@@ -286,6 +298,40 @@ class ToolExecutionContext:
     special_executor: Optional[Callable[[str, dict, dict], str]] = None
     special_tool_names: frozenset[str] = field(default_factory=frozenset)
     cancel_check: Optional[Callable[[], bool]] = None
+    # 下列字段只在运行时内部传递，永不进入模型可见 schema。
+    working_directory: str | None = None
+    evidence_recorder: object | None = None
+    tool_execution_id: str | None = None
+    # Runtime 重放会在审批前预先创建审计记录；普通模型工具调用永远为 None。
+    precreated_evidence_capture: object | None = None
+    workspace_context: object | None = None
+    resolved_metadata: ResolvedToolMetadata | None = None
+
+
+class _DeferredEvidenceCapture:
+    """延后到 retry 执行器确认调用工具时，才创建 bash 证据。"""
+
+    def __init__(self, failure_reporter):
+        self.capture = None
+        self._failure_reporter = failure_reporter
+
+    @property
+    def completed(self) -> bool:
+        return bool(self.capture and self.capture.completed)
+
+    def set_capture(self, capture) -> None:
+        self.capture = capture
+
+    def complete(self, **kwargs) -> None:
+        if self.capture is not None:
+            self.capture.complete(**kwargs)
+
+    def mark_unavailable(self, reason: str) -> None:
+        if self.capture is not None:
+            self.capture.mark_unavailable(reason)
+
+    def report_failure(self, stage: str, error: Exception) -> None:
+        self._failure_reporter(stage, error)
 
 
 _SECRET_PATTERNS = (
@@ -371,9 +417,14 @@ class ToolRegistry:
         run_context = context.run_context
         run_id = getattr(run_context, "run_id", None)
         tool_call_id = tool_call.get("id", "")
-        execution_id = uuid.uuid4().hex
+        execution_id = context.tool_execution_id or uuid.uuid4().hex
+        context = replace(context, tool_execution_id=execution_id)
 
-        if context.db and run_id:
+        if context.db and run_id and execution_context is not None and execution_context.tool_execution_id:
+            # 非 LLM Runtime（例如 /replay）已在审批前登记 ToolExecution，
+            # 这里仅复用同一 ID，避免把拒绝记录丢在执行链外。
+            pass
+        elif context.db and run_id:
             context.db.create_tool_execution(
                 execution_id=execution_id,
                 run_id=run_id,
@@ -443,6 +494,26 @@ class ToolRegistry:
             )
             return self._finish(context, execution_id, result)
 
+        if context.workspace_context is not None:
+            failure_code = getattr(context.workspace_context, "failure_code", None)
+            if failure_code:
+                output = (
+                    "Error: Worktree execution stopped after an earlier workspace "
+                    f"failure ({failure_code})."
+                )
+                return self._finish(
+                    context,
+                    execution_id,
+                    ToolExecutionResult(
+                        ToolStatus.FAILED,
+                        output,
+                        output,
+                        failure_code,
+                        getattr(context.workspace_context, "failure_message", output),
+                        duration_seconds=time.monotonic() - started,
+                    ),
+                )
+
         if context.approval_engine is not None:
             check_result = context.approval_engine.check(
                 name,
@@ -489,22 +560,138 @@ class ToolRegistry:
                 return self._finish(context, execution_id, result)
 
         metadata = self.get_metadata(name).resolve(args)
+        context = replace(context, resolved_metadata=metadata)
         if context.special_executor and name in context.special_tool_names:
             def fn(**unused):
                 return context.special_executor(name, tool_call, args)
         else:
             fn = self._registry[name]["fn"]
 
+        attempt_ids: dict[int, str] = {}
+
+        def _attempt_audit_failed(stage: str, attempt: int, exc: Exception):
+            self._emit(context, "tool_attempt_audit_failed", {
+                "execution_id": execution_id,
+                "tool_name": name,
+                "attempt": attempt,
+                "stage": stage,
+                "error_type": type(exc).__name__,
+            })
+
+        def on_attempt_started(attempt: int):
+            if not (
+                context.db
+                and run_id
+                and hasattr(context.db, "start_tool_retry_attempt")
+            ):
+                return
+            attempt_id = uuid.uuid4().hex
+            try:
+                context.db.start_tool_retry_attempt(
+                    attempt_id=attempt_id,
+                    tool_execution_id=execution_id,
+                    attempt_number=attempt,
+                )
+            except Exception as exc:
+                _attempt_audit_failed("start", attempt, exc)
+                return
+            attempt_ids[attempt] = attempt_id
+            self._emit(context, "tool_attempt_started", {
+                "execution_id": execution_id,
+                "attempt_id": attempt_id,
+                "attempt": attempt,
+            })
+
+        def on_attempt_finished(attempt: int, attempt_result, duration: float):
+            attempt_id = attempt_ids.get(attempt)
+            if not attempt_id:
+                return
+            try:
+                context.db.finish_tool_retry_attempt(
+                    attempt_id=attempt_id,
+                    status=attempt_result.status,
+                    retryable=attempt_result.retryable,
+                    error_code=attempt_result.error_code,
+                    error_message=attempt_result.error_message,
+                    output_preview=attempt_result.output,
+                    duration_seconds=duration,
+                )
+            except Exception as exc:
+                _attempt_audit_failed("finish", attempt, exc)
+                return
+            self._emit(context, "tool_attempt_finished", {
+                "execution_id": execution_id,
+                "attempt_id": attempt_id,
+                "attempt": attempt,
+                "status": attempt_result.status,
+                "error_code": attempt_result.error_code,
+                "duration_seconds": round(duration, 6),
+            })
+
         def on_retry(next_attempt: int, error_code: str, delay: float):
-            self._emit(context, "tool_retrying", {
+            source_attempt = next_attempt - 1
+            attempt_id = attempt_ids.get(source_attempt)
+            if attempt_id:
+                try:
+                    context.db.schedule_tool_retry_wait(
+                        attempt_id=attempt_id,
+                        retry_delay_seconds=delay,
+                    )
+                except Exception as exc:
+                    _attempt_audit_failed("schedule_wait", source_attempt, exc)
+            payload = {
                 "execution_id": execution_id,
                 "tool_name": name,
                 "attempt": next_attempt,
                 "error_code": error_code,
                 "delay_seconds": delay,
+            }
+            self._emit(context, "tool_retry_scheduled", payload)
+            self._emit(context, "tool_retrying", {
+                **payload,
+            })
+
+        def on_retry_wait_finished(
+            next_attempt: int, wait_status: str, duration: float
+        ):
+            source_attempt = next_attempt - 1
+            attempt_id = attempt_ids.get(source_attempt)
+            if attempt_id:
+                try:
+                    context.db.finish_tool_retry_wait(
+                        attempt_id=attempt_id,
+                        status=wait_status,
+                    )
+                except Exception as exc:
+                    _attempt_audit_failed("finish_wait", source_attempt, exc)
+            self._emit(context, "tool_retry_wait_finished", {
+                "execution_id": execution_id,
+                "attempt_id": attempt_id,
+                "next_attempt": next_attempt,
+                "status": wait_status,
+                "duration_seconds": round(duration, 6),
             })
 
         invoke_args = dict(args)
+        evidence_capture = context.precreated_evidence_capture
+        if (
+            name == "bash"
+            and evidence_capture is None
+            and context.evidence_recorder is not None
+            and run_id
+        ):
+            evidence_capture = _DeferredEvidenceCapture(
+                lambda stage, exc: self._emit(
+                    context,
+                    "evidence_capture_failed",
+                    {
+                        "execution_id": execution_id,
+                        "tool_name": name,
+                        "stage": stage,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+            )
         remaining = (
             run_context.remaining_seconds()
             if run_context and hasattr(run_context, "remaining_seconds")
@@ -539,6 +726,85 @@ class ToolRegistry:
                 invoke_args["_cancel_check"] = context.cancel_check
             if "_timeout" in parameters and remaining is not None:
                 invoke_args["_timeout"] = max(0.01, remaining)
+            if name == "bash":
+                if "_evidence_capture" in parameters:
+                    invoke_args["_evidence_capture"] = evidence_capture
+                if "_working_directory" in parameters:
+                    invoke_args["_working_directory"] = context.working_directory
+
+        if context.workspace_context is not None:
+            try:
+                parameters = inspect.signature(fn).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if "_workspace_context" in parameters:
+                invoke_args["_workspace_context"] = context.workspace_context
+
+        if name == "bash":
+            try:
+                inspect.signature(fn).bind(**invoke_args)
+            except TypeError as exc:
+                output = f"ERROR: tool arguments are invalid ({exc})."
+                return self._finish(
+                    context,
+                    execution_id,
+                    ToolExecutionResult(
+                        ToolStatus.FAILED,
+                        output,
+                        output,
+                        "invalid_arguments",
+                        str(exc),
+                        duration_seconds=time.monotonic() - started,
+                    ),
+                )
+
+        def prepare_attempt(attempt: int) -> None:
+            current_remaining = (
+                run_context.remaining_seconds()
+                if run_context and hasattr(run_context, "remaining_seconds")
+                else None
+            )
+            if current_remaining is not None and "_timeout" in invoke_args:
+                invoke_args["_timeout"] = max(0.01, current_remaining)
+            if evidence_capture is None or attempt != 1:
+                return
+            if context.precreated_evidence_capture is not None:
+                return
+            try:
+                evidence_capture.set_capture(context.evidence_recorder.start_bash(
+                    run_id=run_id,
+                    tool_execution_id=execution_id,
+                    command=str(invoke_args.get("command", "")),
+                    working_directory=context.working_directory or ".",
+                    node_run_id=getattr(run_context, "node_run_id", None),
+                    workspace_id=getattr(
+                        context.workspace_context, "workspace_id", None
+                    ),
+                    failure_reporter=evidence_capture.report_failure,
+                ))
+            except Exception as exc:
+                evidence_capture.report_failure("start", exc)
+
+        def retry_guard(next_attempt: int) -> str | None:
+            if context.cancel_check and context.cancel_check():
+                return (
+                    getattr(run_context, "abort_reason", lambda: None)()
+                    or "user_interrupt"
+                )
+            if run_context and hasattr(run_context, "remaining_seconds"):
+                remaining_seconds = run_context.remaining_seconds()
+                if remaining_seconds is not None and remaining_seconds <= 0:
+                    return "deadline_exceeded"
+            allowed_now, _ = policy.allows(name, args)
+            if not allowed_now:
+                return "tool_not_allowed"
+            if context.db and run_id and hasattr(context.db, "get_agent_run"):
+                current_run = context.db.get_agent_run(run_id)
+                if not current_run or current_run.get("status") != "RUNNING":
+                    if current_run and current_run.get("status") == "CANCEL_REQUESTED":
+                        return "user_interrupt"
+                    return "runtime_shutdown"
+            return None
 
         try:
             outcome = execute_with_retry_detailed(
@@ -547,8 +813,14 @@ class ToolRegistry:
                 name,
                 retry_policy=metadata.retry,
                 side_effect=metadata.side_effect,
+                idempotency=metadata.idempotency,
                 cancel_check=context.cancel_check,
+                before_attempt=prepare_attempt,
+                on_attempt_started=on_attempt_started,
+                on_attempt_finished=on_attempt_finished,
                 on_retry=on_retry,
+                on_retry_wait_finished=on_retry_wait_finished,
+                retry_guard=retry_guard,
             )
         except Exception as exc:
             if not getattr(exc, "is_run_control", False):
@@ -570,6 +842,17 @@ class ToolRegistry:
                     side_effects_possible=metadata.side_effect != "none",
                 ),
             )
+
+        if evidence_capture is not None and not getattr(evidence_capture, "completed", False):
+            try:
+                evidence_capture.mark_unavailable("adapter_did_not_finalize")
+            except Exception as exc:
+                self._emit(context, "evidence_capture_failed", {
+                    "execution_id": execution_id,
+                    "tool_name": name,
+                    "stage": "finalize",
+                    "error_type": type(exc).__name__,
+                })
 
         if (
             outcome.status != "SUCCEEDED"
@@ -620,14 +903,18 @@ class ToolRegistry:
         result: ToolExecutionResult,
     ) -> ToolExecutionResult:
         if context.db and getattr(context.run_context, "run_id", None):
+            sanitize = _sanitize_preview
+            recorder = context.evidence_recorder
+            if recorder is not None and hasattr(recorder, "sanitize_preview"):
+                sanitize = recorder.sanitize_preview
             context.db.finish_tool_execution(
                 execution_id=execution_id,
                 status=result.status.value,
                 attempts=result.attempts,
                 retryable=result.retryable,
                 error_code=result.error_code,
-                error_message=_sanitize_preview(result.error_message or "") or None,
-                output_preview=_sanitize_preview(result.output),
+                error_message=sanitize(result.error_message or "") or None,
+                output_preview=sanitize(result.output),
             )
         self._emit(context, "tool_finished", {
             "execution_id": execution_id,
@@ -635,7 +922,40 @@ class ToolRegistry:
             "error_code": result.error_code,
             "attempts": result.attempts,
         })
-        return result
+        if (
+            context.db
+            and getattr(context.run_context, "run_id", None)
+            and hasattr(context.db, "create_initial_failure_recovery")
+        ):
+            try:
+                from agent.recovery import RecoveryController
+
+                controller = RecoveryController(
+                    context.db,
+                    event_callback=lambda event_type, payload: self._emit(
+                        context, event_type, payload
+                    ),
+                )
+                if result.status == ToolStatus.SUCCEEDED:
+                    controller.record_tool_success(execution_id=execution_id)
+                else:
+                    controller.record_tool_failure(
+                        execution_id=execution_id,
+                        result=result,
+                        metadata=context.resolved_metadata,
+                        node_run_id=getattr(
+                            context.run_context, "node_run_id", None
+                        ),
+                        workspace_id=getattr(
+                            context.workspace_context, "workspace_id", None
+                        ),
+                    )
+            except Exception as exc:
+                self._emit(context, "recovery_audit_failed", {
+                    "execution_id": execution_id,
+                    "error_type": type(exc).__name__,
+                })
+        return replace(result, execution_id=execution_id)
 
     def execute(self, tool_call: dict) -> str:
         return self.execute_detailed(tool_call).model_output

@@ -16,6 +16,7 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 
 from agent.agent import Agent
+from agent.reproducibility import ArtifactStore, ExecutionEvidenceRecorder
 from agent.runtime import AgentRuntimeManager, AgentSpec
 from approval import ApprovalEngine, ApprovalMode
 from provider import Provider
@@ -81,6 +82,19 @@ def main():
     clarify_callback = make_clarify_callback(state)
     approval_callback = make_approval_callback(state)
     approval_engine = ApprovalEngine()
+    evidence_recorder = None
+    reproducibility_config = cfg.get_reproducibility_config()
+    if reproducibility_config.get("enabled", True):
+        try:
+            artifact_store = ArtifactStore.from_config(reproducibility_config)
+            evidence_recorder = ExecutionEvidenceRecorder.from_config(
+                artifact_store,
+                db,
+                reproducibility_config,
+                secrets_config=cfg.load(),
+            )
+        except Exception as exc:
+            print_error(f"Execution evidence disabled: {type(exc).__name__}: {exc}")
 
     runtime = None
 
@@ -95,6 +109,7 @@ def main():
             agent_kind="main_turn",
             tool_db=db,
             runtime=runtime,
+            evidence_recorder=evidence_recorder,
         )
 
     def create_ephemeral_agent(spec: AgentSpec, request: dict, run_context):
@@ -112,6 +127,7 @@ def main():
             system_prompt_override=spec.system_prompt or None,
             max_iterations_override=spec.max_iterations,
             runtime=None,
+            evidence_recorder=evidence_recorder,
         )
 
     try:
@@ -119,6 +135,9 @@ def main():
             db,
             agent_factory=create_main_agent,
             ephemeral_factory=create_ephemeral_agent,
+            evidence_recorder=evidence_recorder,
+            approval_engine=approval_engine,
+            approval_callback=approval_callback,
         )
         agent = create_main_agent()
     except Exception as e:

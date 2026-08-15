@@ -1,86 +1,94 @@
 # MiniHermes
 
-轻量级 AI 编程助手 CLI，仿照 [Claude Code](https://claude.ai/code) 和 [Hermes](https://github.com/NousResearch/hermes-agent) 设计。基于 Python 构建，支持任意 OpenAI 兼容 API（DeepSeek、Claude、GPT 等），提供交互式终端界面，具备工具调用、记忆持久化和可扩展技能系统。
-目前针对deepseek-v4-pro做了测试，其他部分模型并未特殊兼容，可能有一些问题。
-
-`每个模块的详细文档都放在了目录/docs下，可以查看`
+MiniHermes 是一个使用 Python 编写的本地 AI 编程助手 CLI。它支持 OpenAI
+兼容接口，并提供流式对话、工具调用、上下文压缩、长期记忆、Skills、计划模式和
+多 Agent 任务执行。目前主要使用 `deepseek-v4-pro` 测试。
 
 ## 快速开始
 
-```bash
-# 全局安装
-pip install minihermes
+要求：Python 3.11+、[uv](https://docs.astral.sh/uv/)。
 
-# 或源码运行
-git clone https://github.com/xxx/minihermes.git
-cd minihermes
+```bash
+git clone https://github.com/12365448949845/miniHermes.git
+cd miniHermes
 uv sync
-python main.py
+uv run python main.py
 ```
 
-首次启动自动进入配置向导，设置 API Key、Base URL、模型名称。
+首次启动会进入配置向导。配置保存在 `~/.minihermes/config.yaml`，至少需要填写
+模型名称、API Key 和 OpenAI 兼容接口地址。
+
+构建并安装命令行版本：
 
 ```bash
-minihermes   # 启动交互式对话
+bash build_wheel.sh
+pip install dist/minihermes-*.whl
+minihermes
 ```
 
-## 基本操作
+## 核心能力
 
-| 操作 | 方式 |
+- **Agent Loop**：模型可以连续调用工具，直到完成任务、被中断或达到预算。
+- **工具与审批**：内置 17 个工具，危险操作需要确认，硬性危险命令直接拒绝。
+- **上下文与记忆**：支持 token 预算、文件引用、摘要压缩、会话恢复和跨会话记忆。
+- **Skills**：支持项目级与用户级技能、条件激活、缓存、安全扫描和生命周期管理。
+- **多 Agent Runtime**：统一记录主 Agent、Plan Agent、Delegate 和后台任务的状态、事件与工具执行。
+- **可复现执行**：保存命令日志、工作区快照和执行证据，支持显式重放与失败审计。
+- **受控并行**：只读子 Agent 可安全并行；写入子 Agent 在 Docker Worktree 中隔离运行。
+- **Graph 工作流**：用节点、边和状态记录工作流执行，为后续恢复与扩展提供统一基础。
+
+## 常用命令
+
+| 命令 | 作用 |
 | --- | --- |
-| 发送消息 | `Enter` |
-| 多行输入 | `Ctrl+J` |
-| 中断回复 | `Ctrl+C` |
-| 退出 | `/exit` 或 `Ctrl+D` |
-| 查看帮助 | `/help` |
-| 规划模式 | `/plan <描述>` |
-| 加载技能 | `/<skill-name>`，如 `/code-review` |
+| `/help` | 查看全部命令 |
+| `/plan <需求>` | 只读分析、生成计划，批准后执行 |
+| `/agents` / `/agent <id>` | 查看 Agent 运行状态和错误 |
+| `/worktrees` / `/worktree <id>` | 查看隔离写入候选及其改动 |
+| `/integrate-worktree <id>` | 验证并合并一个 Worktree 候选 |
+| `/artifacts <run_id>` | 查看执行日志和制品 |
+| `/recoveries <run_id>` | 查看失败分类与处理记录 |
+| `/sessions` / `/resume <id>` | 查看和恢复历史会话 |
+| `/setup` | 修改模型与外部服务配置 |
 
-## 打包
+输入 `@file:path.py` 可以把文件内容加入当前问题；输入 `/<skill-name>` 可以加载
+对应 Skill。按 `Ctrl+C` 中断当前任务，输入 `/exit` 退出。
+
+## Worktree 并行写入
+
+这是可选能力，不影响普通对话和主 Agent 直接工作。启用前需要：
+
+1. Docker Desktop 正在运行，并准备好配置中的本地镜像。
+2. MiniHermes 从主 Git 工作区启动，仓库至少有一次提交且当前状态干净。
+3. 在用户配置中启用 `agent_runtime.worktree`，并将并发数设置为 2。
+
+写入子 Agent 不会直接修改主工作区。系统最多同时运行两个写入任务，更多任务排队；
+完成后保留候选，只有执行 `/integrate-worktree <id>` 并通过验证与审批才会合并。
+
+## 测试
 
 ```bash
-bash build_wheel.sh                    # 构建 wheel 包到 dist/
-pip install dist/minihermes-*.whl      # 全局安装
+uv sync --extra test
+uv run pytest
 ```
 
-构建脚本直接将项目源码打包为标准 wheel，开发环境的可编辑安装与发布包使用同一套代码；安装后 `minihermes` 命令全局可用。
+## 文档
 
-## 主要特性
+详细设计见 [`docs/`](docs/)：
 
-流式对话 · 15 个内置工具 · 技能系统（条件激活 + 安全扫描） · 跨会话记忆 · 安全审批（两层防线） · 上下文自动压缩 · SQLite 持久化 + FTS5 全文搜索 · 子 Agent 委派 · 规划模式（只读分析 → 审批 → 执行）
-
-## 详细文档
-
-完整架构设计和模块文档见 [`docs/`](docs/)：
-
-| 文档 | 内容 |
-| --- | --- |
-| [整体架构](docs/整体架构.md) | 项目总览与架构设计 |
-| [调用链路](docs/01-call-chain.md) | 消息处理主流程 |
-| [系统提示词](docs/02-system-prompt.md) | 12 层系统提示词组装 |
-| [上下文压缩](docs/03-context-compression.md) | 五阶段压缩策略 |
-| [记忆系统](docs/04-memory.md) | 双轨道记忆与自动复盘 |
-| [工具系统](docs/05-tools.md) | 工具注册、执行、审批 |
-| [Provider](docs/06-provider.md) | LLM API 封装 |
-| [Agent 引擎](docs/07-agent.md) | 对话循环与子 Agent |
-| [CLI 界面](docs/08-cli.md) | prompt_toolkit 终端 UI |
-| [会话持久化](docs/09-session.md) | SQLite WAL + FTS5 |
-| [Evolution](docs/10-evolution.md) | Nudge 复盘 + Curator |
-
-## 环境
-
-Python ≥ 3.11 · macOS / Linux / Windows
-
+- [整体架构](docs/整体架构.md)
+- [Agent 调用链路](docs/01-call-chain.md)
+- [上下文压缩](docs/03-context-compression.md)
+- [工具与审批](docs/05-tools.md)
+- [多 Agent Runtime 规划](docs/11-multi-agent-runtime-roadmap.md)
+- [可复现执行](docs/12-reproducible-execution-foundation.md)
+- [Worktree 并行写入](docs/13-worktree-write-parallelism.md)
+- [Graph 工作流](docs/14-graph-engineering-workflow-runtime.md)
+- [失败恢复与回滚](docs/15-failure-recovery-and-rollback.md)
 
 ## 演示
 
-![demo-1](asset/1.png)
-
-![demo-2](asset/2.png)
-
-![demo-3](asset/3.png)
-
-![demo-4](asset/4.png)
+![MiniHermes terminal demo](asset/1.png)
 
 ## License
 

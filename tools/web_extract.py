@@ -5,6 +5,7 @@
 import re
 import requests
 from tools import register
+from tools.retry import trusted_tool_cancelled, trusted_tool_failure
 
 _MAX_CONTENT = 50000
 
@@ -37,7 +38,7 @@ def web_extract(url: str, _timeout: float | None = None,
         url = "https://" + url
 
     if _cancel_check and _cancel_check():
-        return "Error: request cancelled before start"
+        return trusted_tool_cancelled("Error: request cancelled before start")
     timeout = max(0.1, min(15.0, float(_timeout))) if _timeout else 15.0
     try:
         resp = requests.get(
@@ -48,14 +49,45 @@ def web_extract(url: str, _timeout: float | None = None,
         )
         resp.raise_for_status()
     except requests.Timeout:
-        return f"Error: request timed out for {url}"
+        return trusted_tool_failure(
+            f"Error: request timed out for {url}",
+            "timeout",
+            retryable=True,
+        )
     except requests.HTTPError as e:
-        return f"Error: HTTP {e.response.status_code} for {url}"
+        status_code = e.response.status_code
+        retry_after = e.response.headers.get("Retry-After")
+        if status_code == 429:
+            error_code = "rate_limited"
+            retryable = True
+        elif status_code >= 500:
+            error_code = "network_transient"
+            retryable = True
+        elif status_code == 401:
+            error_code = "authentication_failed"
+            retryable = False
+        elif status_code == 403:
+            error_code = "permission_denied"
+            retryable = False
+        else:
+            error_code = "permanent_failure"
+            retryable = False
+        return trusted_tool_failure(
+            f"Error: HTTP {status_code} for {url}",
+            error_code,
+            retryable=retryable,
+            retry_after=retry_after if retryable else None,
+        )
     except requests.RequestException as e:
-        return f"Error: {e}"
+        retryable = isinstance(e, requests.ConnectionError)
+        return trusted_tool_failure(
+            f"Error: {e}",
+            "network_transient" if retryable else "permanent_failure",
+            retryable=retryable,
+        )
 
     if _cancel_check and _cancel_check():
-        return "Error: request cancelled before completion"
+        return trusted_tool_cancelled("Error: request cancelled before completion")
 
     content_type = resp.headers.get("content-type", "")
     if "text/html" not in content_type and "text/plain" not in content_type:

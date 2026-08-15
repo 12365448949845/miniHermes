@@ -6,6 +6,7 @@ from .config import (
     get_image_generation_config,
     get_evolution_config,
     get_agent_runtime_config,
+    get_reproducibility_config,
     MINIHERMES_HOME,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "get_image_generation_config",
     "get_evolution_config",
     "get_agent_runtime_config",
+    "get_reproducibility_config",
     "MINIHERMES_HOME",
 ]

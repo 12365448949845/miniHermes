@@ -8,6 +8,7 @@ from approval import ApprovalEngine, ApprovalMode
 from provider import Provider, StreamResult
 from provider import provider as provider_module
 from session import SessionDB
+from session.db import SCHEMA_VERSION
 from tools import retry as retry_module
 from tools.registry import (
     ToolAccessPolicy,
@@ -283,7 +284,7 @@ def test_schema_v1_migrates_to_v2_without_losing_session_data(tmp_path):
 
     migrated = SessionDB(path)
 
-    assert migrated._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert migrated._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert migrated.get_messages("legacy-session")[0]["content"] == "keep this message"
     assert migrated._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='tool_executions'"

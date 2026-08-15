@@ -20,7 +20,7 @@ Configuration lives at `~/.minihermes/config.yaml` (created by setup wizard from
 ### Testing
 
 ```bash
-uv sync --group test       # Install test deps (pytest, pytest-mock)
+uv sync --extra test       # Install test deps (pytest, pytest-mock)
 pytest                     # Run tests (no test suite exists yet)
 ```
 
@@ -115,6 +115,10 @@ User Input → CLI (prompt_toolkit) → Agent.run_conversation()
 | `/init` | Scan CWD and generate `minihermes.md` context file |
 | `/history` | Show current session ID, turns, message count |
 | `/sessions` | List recent sessions with titles and timestamps |
+| `/worktrees` | List isolated Worktree candidates |
+| `/worktree <id>` | Inspect one Worktree candidate |
+| `/integrate-worktree <id>` | Verify and merge one candidate locally after two approvals |
+| `/discard-worktree <id>` | Permanently discard one unmerged candidate |
 | `/resume <id>` | Restore a previous session (follows compression chain) |
 | `/title <name>` | Set current session title |
 | `/sysprompt` | Print full system prompt (debug) |
@@ -139,9 +143,9 @@ User Input → CLI (prompt_toolkit) → Agent.run_conversation()
 
 ## Sub-agent Delegation
 
-`agent/delegate.py` allows the main agent to spawn sub-agents for self-contained tasks, with their own iteration budget and tool access. The tool schema is registered in `tools/delegate.py`; actual execution is intercepted by `Agent._execute_tool()`.
+`agent/delegate.py` describes self-contained delegation requests; `AgentRuntimeManager` is the only component allowed to create and run their temporary Agents. The tool schema is registered in `tools/delegate.py`, and `Agent._execute_tool()` / the pure-delegate batch path route execution into the Runtime.
 
-Sub-agents have: independent iteration budget (default 50), auto-approved tool calls (no user prompts), no DB persistence, and restricted tool access (cannot delegate further or use clarify).
+Sub-agents have an independent iteration budget (default 50), deadline and cancellation context. Their effective tool policy inherits and can only narrow the parent policy; they cannot delegate again or call `clarify`. Runtime task/run/event/tool metadata is persisted in `SessionDB`, while temporary child conversation messages are not appended to the main session. Ordinary delegates never receive host `write_file` or `bash`; any code-writing delegate must use `worktree_write`, which is forced to `DENY_SENSITIVE`, a fixed tool allowlist, and an isolated Docker-backed Git Worktree. Safe read-only batches may run concurrently. W3 provides exactly two write execution slots: additional writers remain `QUEUED`, and separate Worktrees may modify the same repository-relative path. Worktree creation, integration, discard and cleanup remain serialized, and batch results retain the parent's tool-call order.
 
 ## Plan Mode
 

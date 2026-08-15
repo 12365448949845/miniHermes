@@ -78,6 +78,7 @@ class Agent:
         system_prompt_override: str | None = None,
         max_iterations_override: int | None = None,
         runtime=None,
+        evidence_recorder=None,
     ):
         self.provider = provider
         self.db = db
@@ -98,6 +99,7 @@ class Agent:
         self._approval = approval_engine or ApprovalEngine()
         self.tool_db = tool_db or db
         self.runtime = runtime
+        self.evidence_recorder = evidence_recorder
 
         # system prompt：支持外部覆盖（子 Agent 使用精简 prompt）
         if system_prompt_override is not None:
@@ -227,20 +229,31 @@ class Agent:
                 build_delegate_spec,
             )
 
-            request = DelegationRequest(
-                task=args.get("task", ""),
-                context=args.get("context", ""),
-                tools=(
-                    None
-                    if args.get("tools") is None
-                    else set(args.get("tools") or [])
-                ),
-            )
+            try:
+                request = DelegationRequest(
+                    task=args.get("task", ""),
+                    context=args.get("context", ""),
+                    tools=(
+                        None
+                        if args.get("tools") is None
+                        else set(args.get("tools") or [])
+                    ),
+                    execution_mode=args.get("execution_mode"),
+                    write_scope=(
+                        tuple(args.get("write_scope") or ())
+                        if args.get("write_scope") is not None
+                        else None
+                    ),
+                    verification_hint=args.get("verification_hint", ""),
+                )
+            except (TypeError, ValueError) as exc:
+                return f"Error: Delegation request is invalid: {exc}"
             run_context = self._active_run_context
             if self.runtime is None or run_context is None:
                 return "Error: Delegation failed: runtime context is unavailable"
             spec = build_delegate_spec(request)
             payload = build_delegate_request(request, model=self.provider.model)
+            payload["_host_working_directory"] = os.getcwd()
             outcome = self.runtime.run_ephemeral(
                 spec=spec,
                 request=payload,
@@ -252,8 +265,23 @@ class Agent:
                 renderer=build_delegate_renderer(request),
             )
             if outcome.status.value == "SUCCEEDED" and outcome.result:
-                return outcome.result.final_response or "(subagent produced no response)"
-            return f"Error: Delegation failed: {outcome.error_message or outcome.completion_reason}"
+                response = outcome.result.final_response or "(subagent produced no response)"
+                lease = self.runtime.get_worktree_for_run(outcome.run_id)
+                if lease:
+                    response += (
+                        "\n\n[Worktree candidate preserved: "
+                        f"{lease['workspace_id']} ({lease['lease_status']})]"
+                )
+                return response
+            lease = self.runtime.get_worktree_for_run(outcome.run_id)
+            suffix = (
+                f" [Worktree: {lease['workspace_id']} ({lease['lease_status']})]"
+                if lease else ""
+            )
+            return (
+                "Error: Delegation failed: "
+                f"{outcome.error_message or outcome.completion_reason}{suffix}"
+            )
 
         if tool_name == "session_search" and self.tool_db is not None:
             from tools.session_search import _list_recent, _search
@@ -298,6 +326,9 @@ class Agent:
                 return None
             task = args.get("task", "")
             requested_tools = args.get("tools")
+            execution_mode = args.get("execution_mode")
+            write_scope = args.get("write_scope")
+            verification_hint = args.get("verification_hint", "")
             if (
                 not isinstance(task, str)
                 or not isinstance(args.get("context", ""), str)
@@ -307,20 +338,41 @@ class Agent:
                         not isinstance(requested_tools, list)
                         or not all(isinstance(name, str) for name in requested_tools)
                     )
+                    )
+                or execution_mode not in {None, "read_only", "worktree_write"}
+                or (
+                    write_scope is not None
+                    and (
+                        not isinstance(write_scope, list)
+                        or not all(isinstance(path, str) for path in write_scope)
+                    )
                 )
+                or not isinstance(verification_hint, str)
             ):
                 return None
             allowed, _ = policy.allows("delegate_task", args)
             if not allowed:
                 return None
-            request = DelegationRequest(
-                task=task,
-                context=args.get("context", ""),
-                tools=None if requested_tools is None else set(requested_tools),
-            )
+            try:
+                request = DelegationRequest(
+                    task=task,
+                    context=args.get("context", ""),
+                    tools=None if requested_tools is None else set(requested_tools),
+                    execution_mode=execution_mode,
+                    write_scope=(
+                        tuple(write_scope or ())
+                        if write_scope is not None
+                        else None
+                    ),
+                    verification_hint=verification_hint,
+                )
+            except (TypeError, ValueError):
+                return None
+            payload = build_delegate_request(request, model=self.provider.model)
+            payload["_host_working_directory"] = os.getcwd()
             items.append(DelegateBatchItem(
                 spec=build_delegate_spec(request),
-                request=build_delegate_request(request, model=self.provider.model),
+                request=payload,
                 renderer=build_delegate_renderer(request),
             ))
 
@@ -340,14 +392,25 @@ class Agent:
                     outcome.result.final_response
                     or "(subagent produced no response)"
                 )
+                lease = self.runtime.get_worktree_for_run(outcome.run_id)
+                if lease:
+                    results[tool_call["id"]] += (
+                        "\n\n[Worktree candidate preserved: "
+                        f"{lease['workspace_id']} ({lease['lease_status']})]"
+                    )
             elif outcome.status == RunStatus.TIMED_OUT:
                 results[tool_call["id"]] = (
                     "TIMED_OUT: Delegate batch deadline was reached."
                 )
             else:
+                lease = self.runtime.get_worktree_for_run(outcome.run_id)
+                suffix = (
+                    f" [Worktree: {lease['workspace_id']} ({lease['lease_status']})]"
+                    if lease else ""
+                )
                 results[tool_call["id"]] = (
                     "Error: Delegation failed: "
-                    f"{outcome.error_message or outcome.completion_reason}"
+                    f"{outcome.error_message or outcome.completion_reason}{suffix}"
                 )
         return results
 
@@ -379,6 +442,7 @@ class Agent:
             args = None
 
         old_content = None
+        workspace_context = getattr(run_context, "workspace_context", None)
         if args is not None:
             allowed, _ = policy.allows(tool_name, args)
             if allowed:
@@ -387,9 +451,10 @@ class Agent:
                     args,
                     conversation_id=getattr(run_context, "conversation_id", ""),
                 )
-                old_content = self._snapshot_old_content(
-                    tool_name, args, check_result.action
-                )
+                if workspace_context is None:
+                    old_content = self._snapshot_old_content(
+                        tool_name, args, check_result.action
+                    )
 
         previous_context = self._active_run_context
         previous_session_id = self._active_session_id
@@ -414,6 +479,12 @@ class Agent:
                         if run_context and hasattr(run_context, "is_cancelled")
                         else lambda: self._interrupt_requested
                     ),
+                    working_directory=(
+                        str(workspace_context.workspace_root)
+                        if workspace_context is not None else os.getcwd()
+                    ),
+                    evidence_recorder=self.evidence_recorder,
+                    workspace_context=workspace_context,
                 ),
             )
         finally:
@@ -421,6 +492,45 @@ class Agent:
             self._active_session_id = previous_session_id
 
         tool_result = execution.model_output
+        if self.tool_db is not None and execution.execution_id:
+            from agent.recovery import (
+                ERROR_CODE_REGISTRY,
+                RecoveryAction,
+                RecoveryController,
+            )
+
+            definition = ERROR_CODE_REGISTRY.get(execution.error_code or "")
+            repair_failure = (
+                execution.status != ToolStatus.SUCCEEDED
+                and definition is not None
+                and definition.default_action == RecoveryAction.REPAIR_REQUIRED
+            )
+            try:
+                repair_summary = RecoveryController(
+                    self.tool_db
+                ).build_repair_summary(execution_id=execution.execution_id)
+            except Exception:
+                repair_summary = None
+            if repair_summary is None and repair_failure:
+                repair_summary = "REPAIR_REQUIRED\n" + json.dumps(
+                    {
+                        "contract_version": 1,
+                        "kind": "repair_required",
+                        "tool_execution_id": execution.execution_id,
+                        "error_code": execution.error_code,
+                        "evidence": None,
+                        "diagnostic_excerpt": "",
+                        "diagnostic_trust": "untrusted_data",
+                        "required_action": (
+                            "repair_context_unavailable_stop_and_request_"
+                            "manual_evidence_review"
+                        ),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            if repair_summary is not None:
+                tool_result = repair_summary
 
         # ── 4. 进化计数器重置 ────────────────────────────────────
         if execution.status == ToolStatus.SUCCEEDED and tool_name == "skill_manage":
@@ -605,7 +715,9 @@ class Agent:
             should = self._compressor.should_compress(current_tokens) or self._ctx.force_compress
             if should:
                 self._ctx.force_compress = False
-                _cprint(f"\n{_DIM}⟳ compacting context...{_RST}")
+                # Agent 也可由 Runtime/测试以非交互方式运行；此时没有终端可供输出。
+                if renderer:
+                    _cprint(f"\n{_DIM}⟳ compacting context...{_RST}")
                 working_history, new_sid = self._compressor.compress(
                     working_history, self.db, session_id,
                     agent_run_id=agent_run_id,

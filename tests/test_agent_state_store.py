@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from session import SessionDB
+from session.db import SCHEMA_VERSION
 
 
 def _create_old_database(path):
@@ -82,7 +83,7 @@ def test_old_database_migrates_without_losing_messages_or_fts(tmp_path):
 
     db = SessionDB(path)
 
-    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert db.get_messages("old-session")[0]["content"] == "legacy searchable message"
     assert db.search_messages("searchable")[0]["session_id"] == "old-session"
     message_columns = {

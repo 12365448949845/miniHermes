@@ -1,5 +1,6 @@
-"""串行多 Agent Runtime：统一登记主 Agent Task/Run 与会话句柄。"""
+"""受控并发多 Agent Runtime：统一登记主 Agent Task/Run 与会话句柄。"""
 
+import hashlib
 import json
 import queue
 import re
@@ -10,14 +11,38 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Optional
 
 from agent.agent import Agent, AgentRunAborted, ConversationResult
-from approval import ApprovalMode
+from agent.graph_runner import GraphRunner
+from agent.recovery import RecoveryController
+from agent.reproducibility import (
+    ArtifactRetentionManager,
+    ReplayMaterializer,
+    ReplaySetupError,
+)
+from agent.worktree import (
+    IntegrationWorkspace,
+    WORKTREE_MUTATING_DELEGATE_TOOLS,
+    WORKTREE_REQUIRED_PARENT_TOOLS,
+    WORKTREE_WRITE_TOOLS,
+    WorkspaceManager,
+    WorkspaceIntegrationError,
+    WorkspaceOperationError,
+)
+from agent.workspace_runner import (
+    DockerWorkspaceCommandRunner,
+    WorkspaceCommandResult,
+    WorkspaceRunnerError,
+)
+from approval import ApprovalEngine, ApprovalMode, ApprovalResult
 from provider import ProviderCallLimiter
 from session import SessionDB
 from tools.registry import (
     ToolAccessPolicy,
+    ToolExecutionContext,
+    ToolStatus,
     is_parallel_safe_delegate_policy,
     resolve_tool_access_policy,
 )
@@ -72,7 +97,11 @@ class RunStatus(str, Enum):
 
 
 RUN_TRANSITIONS = {
-    RunStatus.QUEUED: {RunStatus.RUNNING, RunStatus.CANCELLED},
+    RunStatus.QUEUED: {
+        RunStatus.RUNNING,
+        RunStatus.CANCELLED,
+        RunStatus.TIMED_OUT,
+    },
     RunStatus.RUNNING: {
         RunStatus.SUCCEEDED,
         RunStatus.FAILED,
@@ -119,6 +148,11 @@ class AgentRunContext:
     reasoning_tokens: int = 0
     event_callback: Optional[Callable[[str, dict], None]] = None
     cancel_reason: str | None = None
+    # G0 仅携带只读图归属；G1 才由 GraphRunner 实际写入并调度节点。
+    # 放在末尾以保留既有位置参数调用的兼容性。
+    workflow_run_id: str | None = None
+    node_run_id: str | None = None
+    workspace_context: object | None = None
 
     def record_provider_attempt(self):
         self.provider_attempts += 1
@@ -277,10 +311,20 @@ class AgentRuntimeManager:
     def __init__(self, db: SessionDB,
                  agent_factory: Optional[Callable[[], Agent]] = None,
                  ephemeral_factory: Optional[Callable[[AgentSpec, dict, AgentRunContext], Agent]] = None,
-                 runtime_config: dict | None = None):
+                 runtime_config: dict | None = None,
+                 evidence_recorder=None,
+                 approval_engine: ApprovalEngine | None = None,
+                 approval_callback=None,
+                 replay_root: str | Path | None = None,
+                 workspace_manager: WorkspaceManager | None = None,
+                 workspace_runner=None):
         self.db = db
         self._agent_factory = agent_factory
         self._ephemeral_factory = ephemeral_factory
+        self._evidence_recorder = evidence_recorder
+        self._replay_root = replay_root
+        self._approval_engine = approval_engine or ApprovalEngine()
+        self._approval_callback = approval_callback
         self._sessions: dict[str, SessionAgentHandle] = {}
         self._live_runs: dict[str, LiveRunHandle] = {}
         self._live_lock = threading.Lock()
@@ -296,20 +340,78 @@ class AgentRuntimeManager:
             daemon=True,
         )
         self._runtime_config = runtime_config or cfg.get_agent_runtime_config()
+        raw_worktree = self._runtime_config.get("worktree", {})
+        if not isinstance(raw_worktree, dict):
+            raw_worktree = {}
+        try:
+            max_write_concurrency = min(
+                max(int(raw_worktree.get("max_write_concurrency", 1)), 1), 2
+            )
+        except (TypeError, ValueError):
+            max_write_concurrency = 1
+        self._worktree_config = {
+            "enabled": bool(raw_worktree.get("enabled", False)),
+            "max_write_concurrency": max_write_concurrency,
+            "runner": str(raw_worktree.get("runner", "docker") or "docker").lower(),
+            "docker_image": str(raw_worktree.get("docker_image", "") or "").strip(),
+            "docker_user": str(raw_worktree.get("docker_user", "65532:65532") or "65532:65532"),
+            "pids_limit": raw_worktree.get("pids_limit", 256),
+            "memory_limit": str(raw_worktree.get("memory_limit", "1g") or "1g"),
+            "preserve_failed_days": raw_worktree.get("preserve_failed_days", 30),
+            "integration_verification_command": str(
+                raw_worktree.get("integration_verification_command", "") or ""
+            ).strip(),
+        }
+        self._workspace_manager = workspace_manager or WorkspaceManager()
+        self._workspace_runner = workspace_runner
+        self._workspace_runner_error: str | None = None
+        if self._worktree_config["enabled"] and self._workspace_runner is None:
+            if self._worktree_config["runner"] != "docker":
+                self._workspace_runner_error = "strict_docker_runner_required"
+            else:
+                try:
+                    self._workspace_runner = DockerWorkspaceCommandRunner(
+                        self._worktree_config["docker_image"],
+                        container_user=self._worktree_config["docker_user"],
+                        pids_limit=self._worktree_config["pids_limit"],
+                        memory_limit=self._worktree_config["memory_limit"],
+                    )
+                except (WorkspaceRunnerError, TypeError, ValueError) as exc:
+                    self._workspace_runner_error = getattr(
+                        exc, "reason_code", "runner_configuration_invalid"
+                    )
+        self._worktree_write_gate = threading.BoundedSemaphore(
+            self._worktree_config["max_write_concurrency"]
+        )
+        # Git Worktree 创建、集成和清理会修改仓库共享元数据，始终串行。
+        self._worktree_lifecycle_gate = threading.Lock()
         try:
             self._max_delegate_concurrency = min(
                 max(int(self._runtime_config.get("max_concurrency", 1)), 1), 16
             )
         except (TypeError, ValueError):
             self._max_delegate_concurrency = 1
+        self._delegate_execution_gate = threading.BoundedSemaphore(
+            self._max_delegate_concurrency
+        )
+        # Worker 数量负责让等待项先登记为 QUEUED；真正同时执行的数量仍由
+        # _delegate_execution_gate 和 _worktree_write_gate 严格限制。
         self._delegate_executor = ThreadPoolExecutor(
-            max_workers=self._max_delegate_concurrency,
+            max_workers=16,
             thread_name_prefix="minihermes-delegate",
         )
         self._provider_limiter = ProviderCallLimiter(
             self._max_delegate_concurrency
         )
         self.db.reconcile_agent_runs()
+        self.db.reconcile_failure_recoveries()
+        self.db.reconcile_workflow_runs()
+        self.db.reconcile_worktree_integrations()
+        self._workspace_manager.reconcile(
+            self.db,
+            artifact_store=getattr(self._evidence_recorder, "store", None),
+        )
+        self._graph_runner = GraphRunner(self.db)
         self._background_thread.start()
 
     def _attach_provider_limiter(self, agent: Agent | None):
@@ -332,6 +434,61 @@ class AgentRuntimeManager:
         if spec.timeout_seconds is not None:
             return spec
         return replace(spec, timeout_seconds=self._default_timeout(spec.kind))
+
+    def _prepare_worktree_context(
+        self,
+        *,
+        task: dict,
+        run_id: str,
+        request: dict,
+        parent_run_id: str | None,
+        parent_run_context: AgentRunContext | None,
+        resolved_policy: ToolAccessPolicy,
+    ):
+        if not self._worktree_config["enabled"]:
+            raise WorkspaceOperationError(
+                "worktree_disabled", "worktree_write is disabled in configuration"
+            )
+        if self._workspace_runner is None:
+            raise WorkspaceOperationError(
+                self._workspace_runner_error or "strict_runner_unavailable"
+            )
+        if parent_run_id is None or parent_run_context is None:
+            raise WorkspaceOperationError(
+                "worktree_parent_required",
+                "worktree_write must be delegated by a live parent Agent run",
+            )
+        parent_policy = parent_run_context.tool_policy
+        if (
+            parent_policy is None
+            or not WORKTREE_REQUIRED_PARENT_TOOLS <= parent_policy.effective_tools
+        ):
+            raise WorkspaceOperationError(
+                "parent_write_permission_missing",
+                "parent policy must grant bash and write_file before delegation",
+            )
+        if (
+            not WORKTREE_REQUIRED_PARENT_TOOLS <= resolved_policy.effective_tools
+            or not resolved_policy.effective_tools <= WORKTREE_WRITE_TOOLS
+        ):
+            raise WorkspaceOperationError(
+                "worktree_tool_policy_invalid",
+                "effective tools do not match the fixed worktree_write allowlist",
+            )
+        source_directory = request.get("_host_working_directory") or str(Path.cwd())
+        with self._worktree_lifecycle_gate:
+            parent_run_context.raise_if_aborted()
+            return self._workspace_manager.provision(
+                db=self.db,
+                runner=self._workspace_runner,
+                artifact_store=getattr(self._evidence_recorder, "store", None),
+                task_id=task["task_id"],
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                working_directory=source_directory,
+                write_scope=request.get("write_scope") or (),
+                preserve_failed_days=self._worktree_config["preserve_failed_days"],
+            )
 
     @staticmethod
     def _is_control_error(exc: BaseException) -> bool:
@@ -531,6 +688,14 @@ class AgentRuntimeManager:
                                 or "user_interrupt",
                             )
                         raise
+                    graph_context = self._graph_runner.start_main_turn(
+                        task_id=task["task_id"],
+                        agent_run_id=run_id,
+                        conversation_id=conversation_id,
+                        session_id=handle.current_session_id,
+                    )
+                    run_context.workflow_run_id = graph_context.workflow_run_id
+                    run_context.node_run_id = graph_context.node_run_id
                     self._set_deadline(run_context, spec)
                     run_context.raise_if_aborted()
                     try:
@@ -608,12 +773,9 @@ class AgentRuntimeManager:
                 else RunStatus.CANCELLED
             )
             if current and current["status"] == "CANCEL_REQUESTED":
-                self.db.finish_agent_run(
-                    run_id=run_id, task_id=task["task_id"],
-                    status=status.value, completion_reason=exc.completion_reason,
-                    end_session_id=handle.current_session_id,
-                    error_code=exc.error_code,
-                    error_message=exc.safe_message,
+                return self._finish_outcome(
+                    handle, task["task_id"], run_context, result, status,
+                    exc.completion_reason, exc.error_code, exc.safe_message,
                 )
             return AgentRunOutcome(
                 task_id=task["task_id"], run_id=run_id, status=status,
@@ -633,14 +795,9 @@ class AgentRuntimeManager:
                     error_code="user_interrupt",
                 )
             if current and current["status"] in ("RUNNING", "CANCEL_REQUESTED"):
-                self.db.finish_agent_run(
-                    run_id=run_id,
-                    task_id=task["task_id"],
-                    status="FAILED",
-                    completion_reason="internal_error",
-                    end_session_id=handle.current_session_id,
-                    error_code="internal_error",
-                    error_message=safe_error,
+                return self._finish_outcome(
+                    handle, task["task_id"], run_context, result,
+                    RunStatus.FAILED, "internal_error", "internal_error", safe_error,
                 )
             return AgentRunOutcome(
                 task_id=task["task_id"],
@@ -678,6 +835,20 @@ class AgentRuntimeManager:
             raise RuntimeError("ephemeral Agent factory is not configured")
         import tools as tool_registry
         spec = self._effective_spec(spec)
+        execution_mode = request.get("execution_mode")
+        preflight_error: WorkspaceOperationError | None = None
+        if execution_mode not in {None, "read_only", "worktree_write"}:
+            preflight_error = WorkspaceOperationError("invalid_execution_mode")
+        if execution_mode == "worktree_write":
+            if spec.kind != "delegate" or spec.background:
+                preflight_error = WorkspaceOperationError(
+                    "worktree_delegate_required"
+                )
+            spec = replace(
+                spec,
+                tool_policy={"include": set(WORKTREE_WRITE_TOOLS)},
+                approval_mode=ApprovalMode.DENY_SENSITIVE,
+            )
 
         parent_policy = (
             parent_run_context.tool_policy
@@ -699,6 +870,24 @@ class AgentRuntimeManager:
             kind=spec.kind,
             parent_policy=parent_policy,
         )
+        if (
+            preflight_error is None
+            and spec.kind == "delegate"
+            and execution_mode != "worktree_write"
+            and resolved_policy.effective_tools & WORKTREE_MUTATING_DELEGATE_TOOLS
+        ):
+            preflight_error = WorkspaceOperationError(
+                "delegate_write_requires_worktree",
+                "Delegate write_file and bash access requires worktree_write",
+            )
+        if (
+            preflight_error is None
+            and execution_mode == "read_only"
+            and not is_parallel_safe_delegate_policy(resolved_policy)
+        ):
+            preflight_error = WorkspaceOperationError(
+                "read_only_tool_policy_invalid"
+            )
         approval_mode = ApprovalMode.coerce(spec.approval_mode)
         spec = replace(
             spec,
@@ -764,6 +953,10 @@ class AgentRuntimeManager:
             self._live_runs[run_id] = live
 
         result = None
+        workspace_context = None
+        delegate_gate_acquired = False
+        worktree_gate_acquired = False
+        worktree_finalized = False
         try:
             execution_gate = (
                 nullcontext() if _skip_execution_gate else self._execution_gate
@@ -775,13 +968,52 @@ class AgentRuntimeManager:
                     return AgentRunOutcome(
                         task_id=task["task_id"],
                         run_id=run_id,
-                        status=RunStatus.CANCELLED,
+                        status=(
+                            RunStatus.TIMED_OUT
+                            if reason == "deadline_exceeded"
+                            else RunStatus.CANCELLED
+                        ),
+                        completion_reason=reason,
+                        error_code=reason,
+                    )
+                if preflight_error is not None:
+                    self.db.start_agent_run(run_id, task["task_id"])
+                    self._set_deadline(run_context, spec)
+                    raise preflight_error
+                if _skip_execution_gate:
+                    self._acquire_delegate_execution_gate(run_context)
+                    delegate_gate_acquired = True
+                if execution_mode == "worktree_write":
+                    self._acquire_worktree_write_gate(run_context)
+                    worktree_gate_acquired = True
+                if run_context.is_cancelled():
+                    reason = run_context.abort_reason() or "parent_cancelled"
+                    self.db.request_agent_run_cancel(run_id, reason)
+                    return AgentRunOutcome(
+                        task_id=task["task_id"],
+                        run_id=run_id,
+                        status=(
+                            RunStatus.TIMED_OUT
+                            if reason == "deadline_exceeded"
+                            else RunStatus.CANCELLED
+                        ),
                         completion_reason=reason,
                         error_code=reason,
                     )
                 self.db.start_agent_run(run_id, task["task_id"])
                 self._set_deadline(run_context, spec)
                 run_context.raise_if_aborted()
+                if execution_mode == "worktree_write":
+                    workspace_context = self._prepare_worktree_context(
+                        task=task,
+                        run_id=run_id,
+                        request=request,
+                        parent_run_id=parent_run_id,
+                        parent_run_context=parent_run_context,
+                        resolved_policy=resolved_policy,
+                    )
+                    run_context.workspace_context = workspace_context
+                    self._workspace_manager.start(workspace_context)
                 try:
                     child_agent = self._ephemeral_factory(spec, request, run_context)
                     self._attach_provider_limiter(child_agent)
@@ -836,6 +1068,10 @@ class AgentRuntimeManager:
                     terminal = RunStatus.CANCELLED
                     completion_reason = cancel_reason
                     error_code = completion_reason
+                elif workspace_context is not None and workspace_context.failure_code:
+                    terminal = RunStatus.FAILED
+                    completion_reason = workspace_context.failure_code
+                    error_code = workspace_context.failure_code
                 elif result.completion_reason in ("stop", "completed"):
                     terminal = RunStatus.SUCCEEDED
                     completion_reason = result.completion_reason
@@ -844,6 +1080,31 @@ class AgentRuntimeManager:
                     terminal = RunStatus.FAILED
                     completion_reason = result.completion_reason
                     error_code = completion_reason
+                if workspace_context is not None:
+                    try:
+                        lease = self._workspace_manager.finalize(
+                            workspace_context, terminal.value
+                        )
+                        worktree_finalized = True
+                    except Exception as exc:
+                        run_context.emit_event(
+                            "worktree_finalize_failed",
+                            {"error_type": type(exc).__name__},
+                        )
+                        terminal = RunStatus.FAILED
+                        completion_reason = "candidate_finalize_failed"
+                        error_code = completion_reason
+                    else:
+                        if (
+                            terminal == RunStatus.SUCCEEDED
+                            and lease["lease_status"] == "FAILED"
+                        ):
+                            terminal = RunStatus.FAILED
+                            completion_reason = (
+                                lease.get("failure_code")
+                                or "candidate_finalize_failed"
+                            )
+                            error_code = completion_reason
                 self.db.finish_agent_run(
                     run_id=run_id,
                     task_id=task["task_id"],
@@ -867,7 +1128,7 @@ class AgentRuntimeManager:
                 )
         except AgentRunControlError as exc:
             current = self.db.get_agent_run(run_id)
-            if current and current["status"] == "RUNNING":
+            if current and current["status"] in {"QUEUED", "RUNNING"}:
                 self.db.request_agent_run_cancel(run_id, exc.completion_reason)
                 current = self.db.get_agent_run(run_id)
             status = (
@@ -894,9 +1155,39 @@ class AgentRuntimeManager:
                 completion_reason=exc.completion_reason, result=result,
                 error_code=exc.error_code, error_message=exc.safe_message,
             )
+        except WorkspaceOperationError as exc:
+            safe_error = sanitize_preview(str(exc))
+            current = self.db.get_agent_run(run_id)
+            if current and current["status"] in ("RUNNING", "CANCEL_REQUESTED"):
+                self.db.finish_agent_run(
+                    run_id=run_id,
+                    task_id=task["task_id"],
+                    status="FAILED",
+                    completion_reason="worktree_rejected",
+                    end_session_id=session_id,
+                    error_code=exc.reason_code,
+                    error_message=safe_error,
+                )
+            return AgentRunOutcome(
+                task_id=task["task_id"],
+                run_id=run_id,
+                status=RunStatus.FAILED,
+                completion_reason="worktree_rejected",
+                error_code=exc.reason_code,
+                error_message=safe_error,
+            )
         except Exception as exc:
             safe_error = sanitize_preview(f"{type(exc).__name__}: {exc}")
             current = self.db.get_agent_run(run_id)
+            if current and current["status"] in {"CANCELLED", "TIMED_OUT"}:
+                terminal = RunStatus(current["status"])
+                return AgentRunOutcome(
+                    task_id=task["task_id"], run_id=run_id,
+                    status=terminal,
+                    completion_reason=current.get("completion_reason") or terminal.value.lower(),
+                    result=result,
+                    error_code=current.get("completion_reason") or terminal.value.lower(),
+                )
             if current and current["status"] in ("RUNNING", "CANCEL_REQUESTED"):
                 self.db.finish_agent_run(
                     run_id=run_id,
@@ -915,8 +1206,47 @@ class AgentRuntimeManager:
                 error_message=safe_error,
             )
         finally:
+            if workspace_context is not None and not worktree_finalized:
+                try:
+                    current = self.db.get_agent_run(run_id) or {}
+                    self._workspace_manager.finalize(
+                        workspace_context, current.get("status", "FAILED")
+                    )
+                except Exception as exc:
+                    run_context.emit_event(
+                        "worktree_finalize_failed",
+                        {"error_type": type(exc).__name__},
+                    )
+            if worktree_gate_acquired:
+                self._worktree_write_gate.release()
+            if delegate_gate_acquired:
+                self._delegate_execution_gate.release()
             with self._live_lock:
                 self._live_runs.pop(run_id, None)
+
+    def _acquire_delegate_execution_gate(
+        self, run_context: AgentRunContext
+    ) -> None:
+        """等待全局 Delegate 槽位；等待期间 Run 保持 QUEUED。"""
+        while not self._delegate_execution_gate.acquire(timeout=0.1):
+            run_context.raise_if_aborted()
+        try:
+            run_context.raise_if_aborted()
+        except BaseException:
+            self._delegate_execution_gate.release()
+            raise
+
+    def _acquire_worktree_write_gate(
+        self, run_context: AgentRunContext
+    ) -> None:
+        """等待受限写入槽位，同时保留取消和 deadline 语义。"""
+        while not self._worktree_write_gate.acquire(timeout=0.1):
+            run_context.raise_if_aborted()
+        try:
+            run_context.raise_if_aborted()
+        except BaseException:
+            self._worktree_write_gate.release()
+            raise
 
     def _delegate_batch_timeout(self) -> float:
         try:
@@ -950,7 +1280,55 @@ class AgentRuntimeManager:
             kind="delegate",
             parent_policy=parent_policy,
         )
+        execution_mode = item.request.get("execution_mode")
+        if execution_mode == "worktree_write":
+            return bool(
+                self._worktree_config["enabled"]
+                and self._worktree_config["max_write_concurrency"] > 1
+                and self._workspace_runner is not None
+                and WORKTREE_REQUIRED_PARENT_TOOLS <= resolved.effective_tools
+                and resolved.effective_tools <= WORKTREE_WRITE_TOOLS
+            )
+        if execution_mode not in {None, "read_only"}:
+            return False
         return is_parallel_safe_delegate_policy(resolved)
+
+    def _worktree_batch_is_parallel_ready(
+        self, items: list[DelegateBatchItem]
+    ) -> bool:
+        """验证严格 Runner、仓库身份和每个任务自己的冻结写入范围。"""
+        write_items = [
+            item for item in items
+            if item.request.get("execution_mode") == "worktree_write"
+        ]
+        if not write_items:
+            return True
+        if (
+            not self._worktree_config["enabled"]
+            or self._worktree_config["max_write_concurrency"] <= 1
+            or self._workspace_runner is None
+        ):
+            return False
+        try:
+            probe = self._workspace_runner.probe()
+        except Exception:
+            return False
+        if getattr(probe, "backend", None) != "docker":
+            return False
+
+        for item in write_items:
+            source = item.request.get("_host_working_directory") or str(Path.cwd())
+            inspection = self._workspace_manager.inspect_git_workspace(source)
+            if not inspection.eligible or inspection.git_root is None:
+                return False
+            try:
+                self._workspace_manager.validate_write_scope(
+                    item.request.get("write_scope") or (),
+                    workspace_root=inspection.git_root,
+                )
+            except Exception:
+                return False
+        return True
 
     @staticmethod
     def _batch_stopped_outcome(reason: str) -> AgentRunOutcome:
@@ -1006,6 +1384,7 @@ class AgentRuntimeManager:
                 self._delegate_item_is_parallel_safe(item, parent_policy)
                 for item in items
             )
+            and self._worktree_batch_is_parallel_ready(items)
         )
         batch_event = threading.Event()
         deadline = time.monotonic() + self._delegate_batch_timeout()
@@ -1099,7 +1478,15 @@ class AgentRuntimeManager:
                         self._runtime_config.get("cancel_grace_seconds", 3.0)
                     )
                 if cancel_deadline is not None and time.monotonic() >= cancel_deadline:
-                    break
+                    # Worktree writer 必须完成候选审计和 lease 收尾后才能把控制权
+                    # 交还父 Run；Python 线程无法被安全强杀，提前返回会让它继续写 DB。
+                    pending_worktree = any(
+                        items[futures[future]].request.get("execution_mode")
+                        == "worktree_write"
+                        for future in pending
+                    )
+                    if not pending_worktree:
+                        break
 
             for queued_renderer in queued_renderers:
                 if queued_renderer is not None:
@@ -1124,21 +1511,41 @@ class AgentRuntimeManager:
         safe_error = sanitize_preview(error_message or "") or None
         if status in (RunStatus.CANCELLED, RunStatus.TIMED_OUT):
             self._request_cancel_if_running(run_context.run_id, completion_reason)
-        self.db.finish_agent_run(
-            run_id=run_context.run_id,
-            task_id=task_id,
-            status=status.value,
-            completion_reason=completion_reason,
-            end_session_id=handle.current_session_id,
-            result_preview=sanitize_preview(result.final_response if result else ""),
-            error_code=error_code,
-            error_message=safe_error,
-            iterations_used=(result.iterations_used if result else 0),
-            provider_attempts=run_context.provider_attempts,
-            prompt_tokens=run_context.prompt_tokens,
-            completion_tokens=run_context.completion_tokens,
-            reasoning_tokens=run_context.reasoning_tokens,
-        )
+        result_preview = sanitize_preview(result.final_response if result else "")
+        if run_context.workflow_run_id and run_context.node_run_id:
+            self._graph_runner.finish_main_turn(
+                task_id=task_id,
+                agent_run_id=run_context.run_id,
+                workflow_run_id=run_context.workflow_run_id,
+                node_run_id=run_context.node_run_id,
+                agent_status=status.value,
+                completion_reason=completion_reason,
+                end_session_id=handle.current_session_id,
+                result_preview=result_preview,
+                error_code=error_code,
+                error_message=safe_error,
+                iterations_used=(result.iterations_used if result else 0),
+                provider_attempts=run_context.provider_attempts,
+                prompt_tokens=run_context.prompt_tokens,
+                completion_tokens=run_context.completion_tokens,
+                reasoning_tokens=run_context.reasoning_tokens,
+            )
+        else:
+            self.db.finish_agent_run(
+                run_id=run_context.run_id,
+                task_id=task_id,
+                status=status.value,
+                completion_reason=completion_reason,
+                end_session_id=handle.current_session_id,
+                result_preview=result_preview,
+                error_code=error_code,
+                error_message=safe_error,
+                iterations_used=(result.iterations_used if result else 0),
+                provider_attempts=run_context.provider_attempts,
+                prompt_tokens=run_context.prompt_tokens,
+                completion_tokens=run_context.completion_tokens,
+                reasoning_tokens=run_context.reasoning_tokens,
+            )
         return AgentRunOutcome(
             task_id=task_id,
             run_id=run_context.run_id,
@@ -1475,6 +1882,1132 @@ class AgentRuntimeManager:
 
     def list_tool_executions(self, run_id: str) -> list[dict]:
         return self.db.list_tool_executions(run_id)
+
+    def list_tool_retry_attempts(self, tool_execution_id: str) -> list[dict]:
+        return self.db.list_tool_retry_attempts(tool_execution_id)
+
+    def get_recovery(self, recovery_id: str) -> dict | None:
+        return self.db.get_failure_recovery(recovery_id)
+
+    def find_recoveries_by_prefix(
+        self, recovery_id_prefix: str, limit: int = 3
+    ) -> list[dict]:
+        return self.db.find_failure_recoveries_by_prefix(
+            recovery_id_prefix, limit=limit
+        )
+
+    def list_recoveries(
+        self, run_id: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        return self.db.list_failure_recoveries(run_id=run_id, limit=limit)
+
+    def get_execution_record(self, record_id: str) -> dict | None:
+        return self.db.get_execution_record(record_id)
+
+    def get_execution_record_for_tool_execution(
+        self, tool_execution_id: str
+    ) -> dict | None:
+        return self.db.get_execution_record_for_tool_execution(
+            tool_execution_id
+        )
+
+    def list_execution_records(self, run_id: str) -> list[dict]:
+        return self.db.list_execution_records(run_id)
+
+    def find_execution_records_by_prefix(self, record_id_prefix: str) -> list[dict]:
+        return self.db.find_execution_records_by_prefix(record_id_prefix)
+
+    def get_workspace_snapshot(self, snapshot_id: str) -> dict | None:
+        return self.db.get_workspace_snapshot(snapshot_id)
+
+    def list_workspace_snapshots(self, run_id: str) -> list[dict]:
+        return self.db.list_workspace_snapshots(run_id)
+
+    def get_worktree(self, workspace_id: str) -> dict | None:
+        return self.db.get_worktree_lease(workspace_id)
+
+    def get_worktree_for_run(self, run_id: str) -> dict | None:
+        return self.db.get_worktree_lease_for_run(run_id)
+
+    def list_worktrees(
+        self, *, parent_run_id: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        return self.db.list_worktree_leases(
+            parent_run_id=parent_run_id, limit=limit
+        )
+
+    def inspect_worktree(self, workspace_id: str) -> dict:
+        lease = self.db.get_worktree_lease(workspace_id)
+        if not lease:
+            raise KeyError(f"unknown worktree lease: {workspace_id}")
+        result = dict(lease)
+        if Path(lease["worktree_path"]).is_dir():
+            audit = self._workspace_manager.inspect_candidate(lease)
+            result["current_changes"] = list(audit.changes)
+            result["current_violations"] = list(audit.violations)
+        else:
+            result["current_changes"] = []
+            result["current_violations"] = ["worktree directory is unavailable"]
+        result["latest_integration"] = self.db.get_latest_worktree_integration(
+            workspace_id
+        )
+        return result
+
+    def get_worktree_integration(self, integration_id: str) -> dict | None:
+        return self.db.get_worktree_integration(integration_id)
+
+    def list_worktree_integrations(
+        self, *, workspace_id: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        return self.db.list_worktree_integrations(
+            workspace_id=workspace_id, limit=limit
+        )
+
+    def integrate_worktree(self, workspace_id: str) -> dict:
+        """显式验证并集成一个 PRESERVED Worktree 候选。"""
+        command = self._worktree_config["integration_verification_command"]
+        if not command:
+            raise WorkspaceIntegrationError(
+                "integration_verification_command_required",
+                "agent_runtime.worktree.integration_verification_command is empty",
+            )
+        if self._approval_callback is None:
+            raise WorkspaceIntegrationError(
+                "integration_approval_unavailable",
+                "explicit Worktree integration requires an interactive approval callback",
+            )
+        if self._evidence_recorder is None:
+            raise WorkspaceIntegrationError("integration_evidence_unavailable")
+        if self._workspace_runner is None:
+            raise WorkspaceIntegrationError(
+                self._workspace_runner_error or "strict_runner_unavailable"
+            )
+        lease = self.db.get_worktree_lease(workspace_id)
+        if not lease:
+            raise KeyError(f"unknown worktree lease: {workspace_id}")
+        latest = self.db.get_latest_worktree_integration(workspace_id)
+        if lease["lease_status"] == "MERGED":
+            if lease["cleanup_status"] != "SUCCEEDED":
+                try:
+                    self._workspace_manager.cleanup_merged_candidate(
+                        db=self.db,
+                        runner=self._workspace_runner,
+                        workspace_id=workspace_id,
+                    )
+                except Exception:
+                    pass
+            result = dict(latest or {})
+            result["lease"] = self.db.get_worktree_lease(workspace_id)
+            return result
+        if lease["lease_status"] != "PRESERVED":
+            raise WorkspaceIntegrationError("worktree_not_integration_ready")
+        source_run = self.db.get_agent_run(lease["run_id"])
+        if not source_run or source_run["status"] != "SUCCEEDED":
+            raise WorkspaceIntegrationError("source_run_not_succeeded")
+
+        with self._worktree_lifecycle_gate:
+            # gate 等待期间候选可能已被另一个 Runtime 处理，必须重新读取。
+            lease = self.db.get_worktree_lease(workspace_id)
+            if not lease or lease["lease_status"] != "PRESERVED":
+                raise WorkspaceIntegrationError("worktree_not_integration_ready")
+            inspection = self._workspace_manager.inspect_git_workspace(
+                lease["git_root"]
+            )
+            if inspection.head_commit is None:
+                raise WorkspaceIntegrationError(
+                    inspection.primary_reason or "main_head_unavailable"
+                )
+            integration_id = uuid.uuid4().hex
+            task = self.create_task(
+                conversation_id=source_run.get("conversation_id"),
+                session_id=source_run.get("end_session_id"),
+                parent_task_id=lease["task_id"],
+                kind="worktree_integration",
+                request=f"Integrate Worktree candidate {workspace_id}",
+                context=f"source run {lease['run_id']}",
+            )
+            integration_run_id = uuid.uuid4().hex
+            timeout = self._default_timeout("worktree_integration")
+            self.db.create_agent_run(
+                run_id=integration_run_id,
+                task_id=task["task_id"],
+                parent_run_id=lease["run_id"],
+                conversation_id=source_run.get("conversation_id"),
+                start_session_id=source_run.get("end_session_id"),
+                agent_kind="worktree_integration",
+                model="",
+                tool_policy_json="{}",
+                approval_mode=ApprovalMode.INTERACTIVE.value,
+                max_iterations=0,
+                timeout_seconds=timeout,
+            )
+            self.db.start_agent_run(integration_run_id, task["task_id"])
+            try:
+                record = self.db.start_worktree_integration(
+                    integration_id=integration_id,
+                    workspace_id=workspace_id,
+                    integration_run_id=integration_run_id,
+                    source_main_commit=inspection.head_commit,
+                    verification_command_hash=hashlib.sha256(
+                        command.encode("utf-8")
+                    ).hexdigest(),
+                )
+            except Exception as exc:
+                self.db.finish_agent_run(
+                    run_id=integration_run_id,
+                    task_id=task["task_id"],
+                    status="FAILED",
+                    completion_reason="integration_start_failed",
+                    end_session_id=source_run.get("end_session_id"),
+                    error_code=getattr(exc, "reason_code", "integration_start_failed"),
+                    error_message=sanitize_preview(str(exc)),
+                )
+                raise
+
+            integration_run_context = AgentRunContext(
+                task_id=task["task_id"],
+                run_id=integration_run_id,
+                conversation_id=source_run.get("conversation_id") or "",
+                start_session_id=source_run.get("end_session_id") or "",
+                event_callback=lambda event_type, payload: self.db.append_agent_event(
+                    task["task_id"], integration_run_id, event_type, payload
+                ),
+            )
+            if timeout is not None:
+                integration_run_context.deadline_monotonic = time.monotonic() + timeout
+            with self._live_lock:
+                self._live_runs[integration_run_id] = LiveRunHandle(
+                    run_id=integration_run_id,
+                    conversation_id=source_run.get("conversation_id") or "",
+                    agent=None,
+                    owns_agent=True,
+                    cancel_event=integration_run_context.cancel_event,
+                    started_monotonic=time.monotonic(),
+                    deadline_monotonic=integration_run_context.deadline_monotonic,
+                    run_context=integration_run_context,
+                )
+            integration_workspace: IntegrationWorkspace | None = None
+            verification_record_id: str | None = None
+            try:
+                integration_run_context.raise_if_aborted()
+                if not inspection.eligible:
+                    failure = inspection.failures[0]
+                    return self._finish_worktree_integration(
+                        record,
+                        status="PRECONDITION_FAILED",
+                        failure_code=failure.reason_code,
+                        failure_message=failure.message,
+                    )
+                self._workspace_manager.assert_git_identity(lease["git_root"])
+                if not self._approve_worktree_integration(
+                    record,
+                    stage="candidate_commit",
+                    description=(
+                        "Create an immutable candidate commit for this Worktree "
+                        "without moving its branch"
+                    ),
+                    run_context=integration_run_context,
+                ):
+                    return self._finish_worktree_integration(
+                        record,
+                        status="DENIED",
+                        failure_code="candidate_commit_denied",
+                        failure_message="User denied candidate commit preparation",
+                    )
+                integration_run_context.raise_if_aborted()
+                candidate = self._workspace_manager.prepare_candidate_commit(
+                    db=self.db,
+                    artifact_store=self._evidence_recorder.store,
+                    workspace_id=workspace_id,
+                    integration_id=integration_id,
+                )
+                record = self.db.transition_worktree_integration(
+                    integration_id,
+                    status="VERIFYING",
+                    candidate_commit=candidate["candidate_commit"],
+                    candidate_tree_hash=candidate["candidate_tree_hash"],
+                )
+                integration_workspace = (
+                    self._workspace_manager.prepare_integration_workspace(
+                        lease=lease,
+                        integration_id=integration_id,
+                        candidate_commit=candidate["candidate_commit"],
+                        source_main_commit=record["source_main_commit"],
+                        runner=self._workspace_runner,
+                    )
+                )
+                verification = self._run_integration_verification(
+                    record=record,
+                    workspace=integration_workspace,
+                    command=command,
+                    run_context=integration_run_context,
+                )
+                verification_record_id = verification["record_id"]
+                if not verification["success"]:
+                    cleanup_error = self._cleanup_integration_workspace(
+                        record, integration_workspace
+                    )
+                    if cleanup_error:
+                        return self._finish_worktree_integration(
+                            record,
+                            status="FAILED",
+                            failure_code="integration_temp_cleanup_failed",
+                            failure_message=cleanup_error,
+                            verification_record_id=verification_record_id,
+                        )
+                    return self._finish_worktree_integration(
+                        record,
+                        status=(
+                            "CANCELLED"
+                            if verification["error_code"] in {
+                                "cancelled", "deadline_exceeded", "user_interrupt"
+                            }
+                            else "VERIFICATION_FAILED"
+                        ),
+                        failure_code=verification["error_code"],
+                        failure_message=verification["message"],
+                        verification_record_id=verification_record_id,
+                        expected_merge_tree_hash=(
+                            integration_workspace.expected_merge_tree_hash
+                        ),
+                    )
+                self._workspace_manager.validate_integration_verification(
+                    integration_workspace
+                )
+                record = self.db.transition_worktree_integration(
+                    integration_id,
+                    status="READY_TO_APPLY",
+                    expected_merge_tree_hash=(
+                        integration_workspace.expected_merge_tree_hash
+                    ),
+                    verification_record_id=verification_record_id,
+                )
+                cleanup_error = self._cleanup_integration_workspace(
+                    record, integration_workspace
+                )
+                if cleanup_error:
+                    return self._finish_worktree_integration(
+                        record,
+                        status="FAILED",
+                        failure_code="integration_temp_cleanup_failed",
+                        failure_message=cleanup_error,
+                    )
+                if not self._approve_worktree_integration(
+                    record,
+                    stage="final_apply",
+                    description=(
+                        "Apply the verified candidate tree to the current main branch "
+                        "and create a local merge commit"
+                    ),
+                    run_context=integration_run_context,
+                ):
+                    return self._finish_worktree_integration(
+                        record,
+                        status="DENIED",
+                        failure_code="final_apply_denied",
+                        failure_message="User denied final main-branch update",
+                    )
+                integration_run_context.raise_if_aborted()
+                final_commit, final_tree = (
+                    self._workspace_manager.apply_integration_to_main(
+                        workspace=integration_workspace,
+                        runner=self._workspace_runner,
+                    )
+                )
+                completed = self._finish_worktree_integration(
+                    record,
+                    status="MERGED",
+                    final_merge_commit=final_commit,
+                    final_merge_tree_hash=final_tree,
+                    verification_record_id=verification_record_id,
+                )
+                try:
+                    lease = self._workspace_manager.cleanup_merged_candidate(
+                        db=self.db,
+                        runner=self._workspace_runner,
+                        workspace_id=workspace_id,
+                    )
+                except Exception:
+                    lease = self.db.get_worktree_lease(workspace_id)
+                completed["lease"] = lease
+                return completed
+            except AgentRunControlError as exc:
+                if integration_workspace is not None:
+                    self._cleanup_integration_workspace(record, integration_workspace)
+                return self._finish_worktree_integration(
+                    record,
+                    status="CANCELLED",
+                    failure_code=exc.error_code,
+                    failure_message=exc.safe_message,
+                    verification_record_id=verification_record_id,
+                )
+            except WorkspaceOperationError as exc:
+                if integration_workspace is not None:
+                    cleanup_error = self._cleanup_integration_workspace(
+                        record, integration_workspace
+                    )
+                    if cleanup_error and exc.reason_code != "integration_temp_cleanup_failed":
+                        return self._finish_worktree_integration(
+                            record,
+                            status="FAILED",
+                            failure_code="integration_temp_cleanup_failed",
+                            failure_message=cleanup_error,
+                            verification_record_id=verification_record_id,
+                        )
+                elif getattr(exc, "temp_cleanup_succeeded", False):
+                    self.db.set_worktree_integration_cleanup_status(
+                        record["integration_id"], cleanup_status="SUCCEEDED"
+                    )
+                reason_code = getattr(exc, "reason_code", "integration_failed")
+                conflicts = tuple(getattr(exc, "conflicts", ()))
+                status = (
+                    "CONFLICT"
+                    if reason_code in {
+                        "integration_conflict", "final_merge_conflict"
+                    }
+                    else "VERIFICATION_FAILED"
+                    if reason_code.startswith("verification_")
+                    else "FAILED"
+                    if reason_code in {
+                        "candidate_index_restore_failed", "merge_abort_failed",
+                        "integration_path_identity_mismatch",
+                        "integration_temp_identity_mismatch",
+                        "integration_approval_failed",
+                    }
+                    else "PRECONDITION_FAILED"
+                )
+                return self._finish_worktree_integration(
+                    record,
+                    status=status,
+                    failure_code=reason_code,
+                    failure_message=str(exc),
+                    verification_record_id=verification_record_id,
+                    expected_merge_tree_hash=(
+                        integration_workspace.expected_merge_tree_hash
+                        if integration_workspace is not None else None
+                    ),
+                    details={"conflicts": list(conflicts)},
+                )
+            finally:
+                with self._live_lock:
+                    self._live_runs.pop(integration_run_id, None)
+
+    def _approve_worktree_integration(
+        self,
+        record: dict,
+        *,
+        stage: str,
+        description: str,
+        run_context: AgentRunContext,
+    ) -> bool:
+        try:
+            resolution = self._approval_engine.resolve(
+                ApprovalResult(
+                    action="confirm",
+                    pattern_key=f"worktree_integration:{stage}",
+                    description=description,
+                ),
+                "worktree_integration",
+                {
+                    "path": record["workspace_id"],
+                    "stage": stage,
+                    "integration_id": record["integration_id"],
+                },
+                mode=ApprovalMode.INTERACTIVE,
+                approval_callback=self._approval_callback,
+                conversation_id=(
+                    self.db.get_agent_run(record["integration_run_id"]) or {}
+                ).get("conversation_id") or "",
+                run_context=run_context,
+            )
+        except AgentRunControlError:
+            raise
+        except Exception as exc:
+            raise WorkspaceIntegrationError(
+                "integration_approval_failed", str(exc)
+            ) from exc
+        return resolution.allowed
+
+    def _run_integration_verification(
+        self,
+        *,
+        record: dict,
+        workspace: IntegrationWorkspace,
+        command: str,
+        run_context: AgentRunContext,
+    ) -> dict:
+        execution_id = uuid.uuid4().hex
+        self.db.create_tool_execution(
+            execution_id=execution_id,
+            run_id=record["integration_run_id"],
+            tool_call_id=f"integration-verification-{record['integration_id']}",
+            tool_name="bash",
+        )
+        capture = None
+        try:
+            capture = self._evidence_recorder.start_bash(
+                run_id=record["integration_run_id"],
+                tool_execution_id=execution_id,
+                command=command,
+                working_directory=workspace.workspace_root,
+                workspace_id=workspace.workspace_id,
+            )
+            remaining = run_context.remaining_seconds()
+            timeout = min(
+                self._default_timeout("worktree_integration") or 300.0,
+                remaining if remaining is not None else 300.0,
+            )
+            try:
+                result = self._workspace_runner.run(
+                    workspace_id=workspace.workspace_id,
+                    workspace_root=workspace.workspace_root,
+                    task_temp_root=workspace.task_temp_root,
+                    command=command,
+                    cwd_relative=".",
+                    timeout=timeout,
+                    cancel_check=run_context.is_cancelled,
+                )
+            except Exception as exc:
+                result = WorkspaceCommandResult(
+                    stderr=sanitize_preview(str(exc)),
+                    termination_reason="spawn_error",
+                    error_code=getattr(exc, "reason_code", "runner_failed"),
+                )
+            capture.complete(
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.exit_code,
+                termination_reason=result.termination_reason,
+            )
+            abort_reason = run_context.abort_reason()
+            success = (
+                result.exit_code == 0
+                and result.termination_reason == "exited"
+                and abort_reason is None
+            )
+            error_code = (
+                abort_reason if abort_reason in {"deadline_exceeded", "user_interrupt"}
+                else result.error_code
+            ) or (
+                None if success else
+                "integration_verification_timed_out"
+                if result.termination_reason == "timed_out" else
+                "cancelled"
+                if result.termination_reason == "cancelled" else
+                "integration_verification_failed"
+            )
+            self.db.finish_tool_execution(
+                execution_id=execution_id,
+                status="SUCCEEDED" if success else (
+                    "CANCELLED"
+                    if error_code in {"cancelled", "deadline_exceeded", "user_interrupt"}
+                    else "FAILED"
+                ),
+                attempts=1,
+                retryable=False,
+                error_code=error_code,
+                error_message=(None if success else sanitize_preview(result.stderr)),
+                output_preview=sanitize_preview(result.stdout),
+            )
+            return {
+                "success": success,
+                "error_code": error_code,
+                "message": sanitize_preview(result.stderr or result.stdout),
+                "record_id": capture.record_id,
+            }
+        except Exception as exc:
+            if capture is not None and not capture.completed:
+                capture.mark_unavailable("integration_evidence_failed")
+            current = self.db.get_tool_execution(execution_id)
+            if current and current["status"] == "RUNNING":
+                self.db.finish_tool_execution(
+                    execution_id=execution_id,
+                    status="FAILED",
+                    attempts=1,
+                    retryable=False,
+                    error_code="integration_evidence_failed",
+                    error_message=sanitize_preview(str(exc)),
+                    output_preview="",
+                )
+            raise WorkspaceIntegrationError(
+                "integration_evidence_failed", str(exc)
+            ) from exc
+
+    def _cleanup_integration_workspace(
+        self, record: dict, workspace: IntegrationWorkspace
+    ) -> str | None:
+        current = self.db.get_worktree_integration(record["integration_id"])
+        if current and current["temp_cleanup_status"] == "SUCCEEDED":
+            return None
+        try:
+            self._workspace_manager.cleanup_integration_workspace(
+                workspace=workspace, runner=self._workspace_runner
+            )
+            self.db.set_worktree_integration_cleanup_status(
+                record["integration_id"], cleanup_status="SUCCEEDED"
+            )
+            return None
+        except Exception as exc:
+            message = sanitize_preview(f"{type(exc).__name__}: {exc}")
+            try:
+                self.db.set_worktree_integration_cleanup_status(
+                    record["integration_id"],
+                    cleanup_status="FAILED",
+                    failure_message=message,
+                )
+            except Exception:
+                pass
+            return message
+
+    def _finish_worktree_integration(
+        self,
+        record: dict,
+        *,
+        status: str,
+        failure_code: str | None = None,
+        failure_message: str | None = None,
+        verification_record_id: str | None = None,
+        expected_merge_tree_hash: str | None = None,
+        final_merge_commit: str | None = None,
+        final_merge_tree_hash: str | None = None,
+        details: dict | None = None,
+    ) -> dict:
+        artifact_relpath = (
+            f"{record['integration_run_id']}/integrations/"
+            f"{record['integration_id']}/result.json"
+        )
+        payload = {
+            "integration_id": record["integration_id"],
+            "workspace_id": record["workspace_id"],
+            "integration_run_id": record["integration_run_id"],
+            "status": status,
+            "source_main_commit": record["source_main_commit"],
+            "candidate_commit": record.get("candidate_commit"),
+            "candidate_tree_hash": record.get("candidate_tree_hash"),
+            "expected_merge_tree_hash": (
+                expected_merge_tree_hash or record.get("expected_merge_tree_hash")
+            ),
+            "final_merge_commit": final_merge_commit,
+            "final_merge_tree_hash": final_merge_tree_hash,
+            "verification_record_id": verification_record_id,
+            "verification_command_hash": record["verification_command_hash"],
+            "failure_code": failure_code,
+            "failure_message": sanitize_preview(failure_message or ""),
+            "details": details or {},
+            "recorded_at": time.time(),
+        }
+        artifact_hash = None
+        try:
+            self._evidence_recorder.store.write_json_atomic(
+                artifact_relpath, payload
+            )
+            artifact_hash = hashlib.sha256(
+                self._evidence_recorder.store.read_bytes(artifact_relpath)
+            ).hexdigest()
+        except Exception:
+            if status == "MERGED":
+                raise
+            artifact_relpath = None
+        completed = self.db.finish_worktree_integration(
+            record["integration_id"],
+            status=status,
+            final_merge_commit=final_merge_commit,
+            final_merge_tree_hash=final_merge_tree_hash,
+            expected_merge_tree_hash=expected_merge_tree_hash,
+            verification_record_id=verification_record_id,
+            failure_code=failure_code,
+            failure_message=failure_message,
+            result_artifact_relpath=artifact_relpath,
+            result_artifact_hash=artifact_hash,
+        )
+        run = self.db.get_agent_run(record["integration_run_id"])
+        if run and run["status"] in {"RUNNING", "CANCEL_REQUESTED"}:
+            run_status = "SUCCEEDED" if status == "MERGED" else (
+                "TIMED_OUT" if failure_code == "deadline_exceeded" else
+                "CANCELLED" if status in {"DENIED", "CANCELLED"} else "FAILED"
+            )
+            if run_status in {"CANCELLED", "TIMED_OUT"} and run["status"] == "RUNNING":
+                self.db.request_agent_run_cancel(
+                    record["integration_run_id"], failure_code or status.lower()
+                )
+            self.db.finish_agent_run(
+                run_id=record["integration_run_id"],
+                task_id=run["task_id"],
+                status=run_status,
+                completion_reason=status.lower(),
+                end_session_id=run.get("end_session_id"),
+                result_preview=(
+                    f"Worktree integration {record['integration_id']}: {status}"
+                ),
+                error_code=None if status == "MERGED" else failure_code,
+                error_message=None if status == "MERGED" else sanitize_preview(
+                    failure_message or ""
+                ),
+            )
+        completed["lease"] = self.db.get_worktree_lease(record["workspace_id"])
+        return completed
+
+    def discard_worktree(self, workspace_id: str) -> dict:
+        lease = self.db.get_worktree_lease(workspace_id)
+        if not lease:
+            raise KeyError(f"unknown worktree lease: {workspace_id}")
+        controller = RecoveryController(
+            self.db,
+            event_callback=lambda event_type, payload: self.db.append_agent_event(
+                lease["task_id"], lease["run_id"], event_type, payload
+            ),
+        )
+        with self._worktree_lifecycle_gate:
+            return controller.discard_worktree(
+                workspace_manager=self._workspace_manager,
+                runner=self._workspace_runner,
+                artifact_store=getattr(self._evidence_recorder, "store", None),
+                workspace_id=workspace_id,
+            )
+
+    def inspect_execution_artifact_retention(self) -> dict:
+        """返回只读的制品保留概览；没有证据存储时不伪造结果。"""
+        manager, options = self._artifact_retention_manager()
+        return manager.inspect(
+            retention_days=options["retention_days"],
+            keep_failed_days=options["keep_failed_days"],
+        )
+
+    def cleanup_execution_artifacts(self) -> dict:
+        """显式清理到期制品；所有状态判断和删除都留在受限管理器内。"""
+        manager, options = self._artifact_retention_manager()
+        return manager.cleanup(
+            retention_days=options["retention_days"],
+            keep_failed_days=options["keep_failed_days"],
+            max_total_artifact_bytes=options["max_total_artifact_bytes"],
+        )
+
+    def _artifact_retention_manager(self) -> tuple[ArtifactRetentionManager, dict]:
+        if self._evidence_recorder is None:
+            raise RuntimeError("execution evidence is not available")
+        options = cfg.get_reproducibility_config()
+        return ArtifactRetentionManager(self._evidence_recorder.store, self.db), options
+
+    def replay_execution(self, record_id: str, *, conversation_id: str | None = None) -> AgentRunOutcome:
+        """在系统管理的临时副本重放一条历史 bash 记录，不调用模型。"""
+        if self._evidence_recorder is None:
+            raise RuntimeError("execution evidence is not available")
+        materializer = ReplayMaterializer(
+            self._evidence_recorder.store, self.db, replay_root=self._replay_root
+        )
+        source_record = self.db.get_execution_record(record_id)
+        if source_record is None:
+            raise ReplaySetupError("record_not_found")
+        original_run = self.db.get_agent_run(source_record["run_id"])
+        if original_run is None:
+            self._mark_source_replay_unavailable(record_id, "source_run_not_found")
+            raise ReplaySetupError("source_run_not_found")
+        effective_conversation_id = conversation_id or original_run.get("conversation_id") or ""
+        task = self.create_task(
+            conversation_id=effective_conversation_id,
+            session_id=None,
+            kind="replay",
+            request=f"Replay bash record {record_id}",
+            parent_task_id=original_run["task_id"],
+        )
+        run_id = uuid.uuid4().hex
+        run = self.db.create_agent_run(
+            run_id=run_id,
+            task_id=task["task_id"],
+            parent_run_id=original_run["run_id"],
+            conversation_id=effective_conversation_id,
+            start_session_id=None,
+            agent_kind="replay",
+            model="",
+            tool_policy_json=json.dumps({"include": ["bash"]}),
+            approval_mode=ApprovalMode.INTERACTIVE.value,
+            max_iterations=0,
+            timeout_seconds=self._default_timeout("replay"),
+        )
+        run_context = AgentRunContext(
+            task_id=task["task_id"],
+            run_id=run["run_id"],
+            conversation_id=effective_conversation_id,
+            start_session_id="",
+            tool_policy=resolve_tool_access_policy(
+                {"include": {"bash"}}, {"bash"}
+            ),
+            event_callback=lambda event_type, payload: self.db.append_agent_event(
+                task["task_id"], run_id, event_type, payload
+            ),
+        )
+        self._set_deadline(
+            run_context,
+            AgentSpec(kind="replay", timeout_seconds=self._default_timeout("replay")),
+        )
+        live = LiveRunHandle(
+            run_id=run_id,
+            conversation_id=effective_conversation_id,
+            agent=None,
+            owns_agent=False,
+            cancel_event=run_context.cancel_event,
+            started_monotonic=time.monotonic(),
+            deadline_monotonic=run_context.deadline_monotonic,
+            run_context=run_context,
+        )
+        with self._live_lock:
+            self._live_runs[run_id] = live
+
+        capture = None
+        execution_id = uuid.uuid4().hex
+        try:
+            with self._execution_gate:
+                try:
+                    self.db.start_agent_run(run_id, task["task_id"])
+                except RuntimeError:
+                    current = self.db.get_agent_run(run_id)
+                    if current and current["status"] == "CANCELLED":
+                        self.db.update_execution_replay_status(
+                            source_record["record_id"], "REPLAY_CANCELLED"
+                        )
+                        return AgentRunOutcome(
+                            task_id=task["task_id"],
+                            run_id=run_id,
+                            status=RunStatus.CANCELLED,
+                            completion_reason="user_interrupt",
+                            error_code="user_interrupt",
+                        )
+                    raise
+                self.db.create_tool_execution(
+                    execution_id=execution_id,
+                    run_id=run_id,
+                    tool_call_id=f"replay-{source_record['record_id']}",
+                    tool_name="bash",
+                )
+                run_context.raise_if_aborted()
+                try:
+                    source = materializer.load_source(source_record["record_id"])
+                except ReplaySetupError as exc:
+                    self._record_unavailable_replay_attempt(
+                        run_id=run_id,
+                        tool_execution_id=execution_id,
+                        source_record_id=source_record["record_id"],
+                        reason=exc.reason_code,
+                    )
+                    self.db.update_execution_replay_status(
+                        source_record["record_id"], "REPLAY_UNAVAILABLE"
+                    )
+                    return self._finish_replay_run(
+                        run_context, task["task_id"], RunStatus.FAILED,
+                        "replay_unavailable", exc.reason_code, "replay_unavailable",
+                    )
+                try:
+                    materialization = materializer.materialize(source)
+                except ReplaySetupError as exc:
+                    capture = self._create_replay_preflight_capture(
+                        run_id=run_id,
+                        tool_execution_id=execution_id,
+                        source=source,
+                    )
+                    self._finish_replay_without_shell(
+                        run_context, task["task_id"], source.record["record_id"],
+                        capture, execution_id, "REPLAY_SETUP_FAILED", exc.reason_code,
+                    )
+                    return AgentRunOutcome(
+                        task_id=task["task_id"],
+                        run_id=run_id,
+                        status=RunStatus.FAILED,
+                        completion_reason="replay_setup_failed",
+                        error_code="replay_setup_failed",
+                        error_message=exc.reason_code,
+                    )
+
+                capture = self._evidence_recorder.prepare_replay_bash(
+                    run_id=run_id,
+                    tool_execution_id=execution_id,
+                    command=source.command,
+                    working_directory=materialization.working_directory,
+                    snapshot_id=source.snapshot["snapshot_id"],
+                    working_directory_rel=source.working_directory_rel,
+                    replayed_from_record_id=source.record["record_id"],
+                )
+                import tools as tool_registry
+                tool_call = {
+                    "id": f"replay-{source.record['record_id']}",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": json.dumps({"command": source.command}),
+                    },
+                }
+                result = tool_registry.get_tool_manager().execute_detailed(
+                    tool_call,
+                    ToolExecutionContext(
+                        policy=run_context.tool_policy,
+                        # 重放永远使用新的审批状态，不能复用源会话的“本会话允许”。
+                        approval_engine=ApprovalEngine(),
+                        approval_mode=ApprovalMode.INTERACTIVE,
+                        approval_callback=self._approval_callback,
+                        run_context=run_context,
+                        db=self.db,
+                        cancel_check=run_context.is_cancelled,
+                        working_directory=str(materialization.working_directory),
+                        evidence_recorder=self._evidence_recorder,
+                        tool_execution_id=execution_id,
+                        precreated_evidence_capture=capture,
+                    ),
+                )
+                if result.status == ToolStatus.DENIED:
+                    capture.finish_without_execution(
+                        replay_status="REPLAY_DENIED", reason=result.error_code or "approval_denied"
+                    )
+                    self.db.update_execution_replay_status(
+                        source.record["record_id"], "REPLAY_DENIED"
+                    )
+                    return self._finish_replay_run(
+                        run_context, task["task_id"], RunStatus.CANCELLED,
+                        "replay_denied", result.model_output, "approval_denied",
+                    )
+                if result.status == ToolStatus.CANCELLED:
+                    abort_reason = result.error_code or "user_interrupt"
+                    replay_status = (
+                        "REPLAY_TIMED_OUT"
+                        if abort_reason == "deadline_exceeded"
+                        else "REPLAY_CANCELLED"
+                    )
+                    capture.finish_without_execution(
+                        replay_status=replay_status, reason=abort_reason
+                    )
+                    self.db.update_execution_replay_status(
+                        source.record["record_id"], replay_status
+                    )
+                    return self._finish_replay_run(
+                        run_context, task["task_id"],
+                        RunStatus.TIMED_OUT if abort_reason == "deadline_exceeded" else RunStatus.CANCELLED,
+                        abort_reason, result.model_output, abort_reason,
+                    )
+                replay_record = self.db.get_execution_record(capture.record_id)
+                replay_status = replay_record.get("replay_status", "REPLAY_COMMAND_FAILED")
+                self.db.update_execution_replay_status(source.record["record_id"], replay_status)
+                terminal = {
+                    "REPLAY_SUCCEEDED": RunStatus.SUCCEEDED,
+                    "REPLAY_CANCELLED": RunStatus.CANCELLED,
+                    "REPLAY_TIMED_OUT": RunStatus.TIMED_OUT,
+                }.get(replay_status, RunStatus.FAILED)
+                return self._finish_replay_run(
+                    run_context, task["task_id"], terminal,
+                    "replay_succeeded" if terminal == RunStatus.SUCCEEDED else (
+                        "deadline_exceeded" if terminal == RunStatus.TIMED_OUT else (
+                            "user_interrupt" if terminal == RunStatus.CANCELLED else "replay_command_failed"
+                        )
+                    ),
+                    result.model_output,
+                    None if terminal == RunStatus.SUCCEEDED else (
+                        "deadline_exceeded" if terminal == RunStatus.TIMED_OUT else (
+                            "user_interrupt" if terminal == RunStatus.CANCELLED else "replay_command_failed"
+                        )
+                    ),
+                )
+        except AgentRunControlError as exc:
+            replay_status = (
+                "REPLAY_TIMED_OUT"
+                if exc.completion_reason == "deadline_exceeded"
+                else "REPLAY_CANCELLED"
+            )
+            if capture is not None and not capture.completed:
+                capture.finish_without_execution(
+                    replay_status=replay_status, reason=exc.completion_reason
+                )
+            tool_execution = self.db.get_tool_execution(execution_id)
+            if tool_execution and tool_execution["status"] == "RUNNING":
+                if capture is None:
+                    self._record_preexecution_replay_attempt(
+                        run_id=run_id,
+                        tool_execution_id=execution_id,
+                        source_record_id=source_record["record_id"],
+                        replay_status=replay_status,
+                        reason=exc.completion_reason,
+                    )
+                else:
+                    self.db.finish_tool_execution(
+                        execution_id=execution_id,
+                        status="CANCELLED",
+                        attempts=0,
+                        retryable=False,
+                        error_code=exc.completion_reason,
+                        error_message=sanitize_preview(exc.safe_message),
+                        output_preview="",
+                    )
+            self.db.update_execution_replay_status(source_record["record_id"], replay_status)
+            current = self.db.get_agent_run(run_id)
+            if current and current["status"] == "RUNNING":
+                self.db.request_agent_run_cancel(run_id, exc.completion_reason)
+            return self._finish_replay_run(
+                run_context, task["task_id"],
+                RunStatus.TIMED_OUT if exc.completion_reason == "deadline_exceeded" else RunStatus.CANCELLED,
+                exc.completion_reason, exc.safe_message, exc.error_code,
+            )
+        except Exception as exc:
+            safe_error = sanitize_preview(f"{type(exc).__name__}: {exc}")
+            if capture is not None and not capture.completed:
+                capture.finish_without_execution(
+                    replay_status="REPLAY_SETUP_FAILED", reason="replay_internal_error"
+                )
+            tool_execution = self.db.get_tool_execution(execution_id)
+            if tool_execution and tool_execution["status"] == "RUNNING":
+                self.db.finish_tool_execution(
+                    execution_id=execution_id,
+                    status="FAILED",
+                    attempts=0,
+                    retryable=False,
+                    error_code="replay_internal_error",
+                    error_message=safe_error,
+                    output_preview="",
+                )
+            self.db.update_execution_replay_status(
+                source_record["record_id"], "REPLAY_SETUP_FAILED"
+            )
+            current = self.db.get_agent_run(run_id)
+            if current and current["status"] in ("RUNNING", "CANCEL_REQUESTED"):
+                if current["status"] == "CANCEL_REQUESTED":
+                    self.db.finish_agent_run(
+                        run_id=run_id, task_id=task["task_id"], status="CANCELLED",
+                        completion_reason="user_interrupt", end_session_id=None,
+                        error_code="user_interrupt", error_message=safe_error,
+                    )
+                else:
+                    self.db.finish_agent_run(
+                        run_id=run_id, task_id=task["task_id"], status="FAILED",
+                        completion_reason="replay_internal_error", end_session_id=None,
+                        error_code="replay_internal_error", error_message=safe_error,
+                    )
+            return AgentRunOutcome(
+                task["task_id"], run_id, RunStatus.FAILED, "replay_internal_error",
+                error_code="replay_internal_error", error_message=safe_error,
+            )
+        finally:
+            with self._live_lock:
+                self._live_runs.pop(run_id, None)
+
+    def _mark_source_replay_unavailable(self, record_id: str, reason: str) -> None:
+        try:
+            self.db.update_execution_replay_status(record_id, "REPLAY_UNAVAILABLE")
+        except KeyError:
+            pass
+
+    def _record_unavailable_replay_attempt(
+        self,
+        *,
+        run_id: str,
+        tool_execution_id: str,
+        source_record_id: str,
+        reason: str,
+    ) -> None:
+        """源制品预检失败时，仍留下关联到 ToolExecution 的终态审计记录。"""
+        self._record_preexecution_replay_attempt(
+            run_id=run_id,
+            tool_execution_id=tool_execution_id,
+            source_record_id=source_record_id,
+            replay_status="REPLAY_UNAVAILABLE",
+            reason=reason,
+        )
+
+    def _record_preexecution_replay_attempt(
+        self,
+        *,
+        run_id: str,
+        tool_execution_id: str,
+        source_record_id: str,
+        replay_status: str,
+        reason: str,
+    ) -> None:
+        """命令尚未启动时也关闭 ToolExecution 与 ExecutionRecord。"""
+        record_id = uuid.uuid4().hex
+        self.db.create_execution_record(
+            record_id=record_id,
+            run_id=run_id,
+            tool_execution_id=tool_execution_id,
+            tool_name="bash",
+            command_preview="replay unavailable",
+            replayed_from_record_id=source_record_id,
+        )
+        self.db.finish_execution_record(
+            record_id=record_id,
+            log_status="UNAVAILABLE",
+            reproducibility_status="UNAVAILABLE",
+            artifact_status="INCOMPLETE",
+            termination_reason=sanitize_preview(reason),
+            replay_status=replay_status,
+        )
+        self.db.finish_tool_execution(
+            execution_id=tool_execution_id,
+            status="CANCELLED" if replay_status in {
+                "REPLAY_CANCELLED", "REPLAY_TIMED_OUT"
+            } else "FAILED",
+            attempts=0,
+            retryable=False,
+            error_code=(
+                reason if replay_status in {"REPLAY_CANCELLED", "REPLAY_TIMED_OUT"}
+                else "replay_unavailable"
+            ),
+            error_message=sanitize_preview(reason),
+            output_preview="",
+        )
+
+    def _finish_replay_without_shell(
+        self, run_context: AgentRunContext, task_id: str, source_record_id: str,
+        capture, execution_id: str, replay_status: str, reason: str,
+    ) -> None:
+        if capture is not None:
+            capture.finish_without_execution(replay_status=replay_status, reason=reason)
+        tool_execution = self.db.get_tool_execution(execution_id)
+        if tool_execution and tool_execution["status"] == "RUNNING":
+            self.db.finish_tool_execution(
+                execution_id=execution_id,
+                status="FAILED",
+                attempts=0,
+                retryable=False,
+                error_code="replay_setup_failed",
+                error_message=sanitize_preview(reason),
+                output_preview="",
+            )
+        self.db.update_execution_replay_status(source_record_id, replay_status)
+        self._finish_replay_run(
+            run_context, task_id, RunStatus.FAILED, "replay_setup_failed", reason,
+            "replay_setup_failed",
+        )
+
+    def _create_replay_preflight_capture(self, *, run_id: str, tool_execution_id: str, source):
+        """材料化失败时仍可用源快照信息创建一条未执行的重放记录。"""
+        try:
+            return self._evidence_recorder.prepare_replay_bash(
+                run_id=run_id,
+                tool_execution_id=tool_execution_id,
+                command=source.command,
+                working_directory=source.snapshot["git_root"],
+                snapshot_id=source.snapshot["snapshot_id"],
+                working_directory_rel=source.working_directory_rel,
+                replayed_from_record_id=source.record["record_id"],
+            )
+        except Exception:
+            return None
+
+    def _finish_replay_run(
+        self, run_context: AgentRunContext, task_id: str, status: RunStatus,
+        completion_reason: str, result_preview: str, error_code: str | None,
+    ) -> AgentRunOutcome:
+        if status in (RunStatus.CANCELLED, RunStatus.TIMED_OUT):
+            self._request_cancel_if_running(run_context.run_id, completion_reason)
+        self.db.finish_agent_run(
+            run_id=run_context.run_id,
+            task_id=task_id,
+            status=status.value,
+            completion_reason=completion_reason,
+            end_session_id=None,
+            result_preview=sanitize_preview(result_preview),
+            error_code=error_code,
+            error_message=sanitize_preview(result_preview) if error_code else None,
+        )
+        return AgentRunOutcome(
+            task_id, run_context.run_id, status, completion_reason,
+            error_code=error_code,
+            error_message=sanitize_preview(result_preview) if error_code else None,
+        )
 
     def interrupt_current(self, conversation_id: str,
                           reason: str = "user_interrupt") -> str | None:

@@ -51,9 +51,15 @@ def _add_line_numbers(lines: list[str], start: int) -> str:
         },
     },
 })
-def read_file(path: str, offset: int = 1, limit: int = 500) -> str:
+def read_file(
+    path: str, offset: int = 1, limit: int = 500, _workspace_context=None
+) -> str:
     try:
-        p = Path(path).expanduser()
+        p = (
+            _workspace_context.resolve_path(path)
+            if _workspace_context is not None
+            else Path(path).expanduser()
+        )
         if not p.exists():
             return f"Error: file not found: {path}"
         if not p.is_file():
@@ -150,7 +156,9 @@ MAX_WRITE_CHARS = 8000
         },
     },
 })
-def write_file(path: str, content: str, append: bool = False) -> str:
+def write_file(
+    path: str, content: str, append: bool = False, _workspace_context=None
+) -> str:
     if len(content) > MAX_WRITE_CHARS:
         return (
             f"ERROR: content too large ({len(content)} chars > {MAX_WRITE_CHARS} char limit). "
@@ -160,7 +168,11 @@ def write_file(path: str, content: str, append: bool = False) -> str:
             f"with append=true. Split on natural boundaries (paragraph / function / section breaks)."
         )
     try:
-        p = Path(path).expanduser()
+        p = (
+            _workspace_context.resolve_path(path, require_write=True)
+            if _workspace_context is not None
+            else Path(path).expanduser()
+        )
         p.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if append else "w"
         with open(p, mode, encoding="utf-8") as f:
@@ -196,9 +208,15 @@ def write_file(path: str, content: str, append: bool = False) -> str:
         },
     },
 })
-def list_dir(path: str = ".", show_hidden: bool = False) -> str:
+def list_dir(
+    path: str = ".", show_hidden: bool = False, _workspace_context=None
+) -> str:
     try:
-        p = Path(path).expanduser()
+        p = (
+            _workspace_context.resolve_path(path, allow_root=True)
+            if _workspace_context is not None
+            else Path(path).expanduser()
+        )
         if not p.exists():
             return f"Error: path not found: {path}"
         if not p.is_dir():

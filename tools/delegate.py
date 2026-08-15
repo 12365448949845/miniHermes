@@ -43,8 +43,38 @@ _SCHEMA = {
                     "uniqueItems": True,
                     "description": (
                         "Optional tool allowlist for this subagent. Omit to use the "
-                        "available delegate tool set; pass an empty list for no tools. "
-                        "The runtime always intersects this list with the parent policy."
+                        "available non-writing delegate tool set; pass an empty list for no tools. "
+                        "Requesting write_file or bash requires execution_mode=worktree_write "
+                        "and a non-empty write_scope. The runtime always intersects this list "
+                        "with the parent policy."
+                    ),
+                },
+                "execution_mode": {
+                    "type": "string",
+                    "enum": ["read_only", "worktree_write"],
+                    "description": (
+                        "Optional execution contract. Use read_only for side-effect-free analysis. "
+                        "Use worktree_write for every subagent that may modify code or run shell "
+                        "commands, even when changing one file. Omitted mode cannot receive "
+                        "write_file or bash and never writes the main workspace."
+                    ),
+                },
+                "write_scope": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "description": (
+                        "Required for worktree_write: relative files or directory prefixes "
+                        "ending in '/'. Absolute paths, wildcards, '..', .git, and .minihermes "
+                        "are forbidden."
+                    ),
+                },
+                "verification_hint": {
+                    "type": "string",
+                    "description": (
+                        "Optional test command suggestion for the child. It is not executed "
+                        "automatically and cannot bypass normal tool approval."
                     ),
                 },
             },
@@ -59,6 +89,9 @@ def delegate_task(
     task: str,
     context: str = "",
     tools: list[str] | None = None,
+    execution_mode: str | None = None,
+    write_scope: list[str] | None = None,
+    verification_hint: str = "",
 ) -> str:
     """Placeholder — execution intercepted by Agent._execute_tool()."""
     return "Error: delegate_task must be executed within an Agent context."

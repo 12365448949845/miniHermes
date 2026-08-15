@@ -31,10 +31,34 @@ agent_runtime:
   # Delegate 并发默认关闭。提高此值前，子 Agent 必须只申请并行安全的只读工具。
   max_concurrency: 1
   delegate_batch_timeout_seconds: 300
+  worktree:
+    # 默认关闭；W3 仅支持把写入并发从 1 显式提高到 2。
+    enabled: false
+    max_write_concurrency: 1
+    runner: "docker"
+    docker_image: ""
+    docker_user: "65532:65532"
+    pids_limit: 256
+    memory_limit: "1g"
+    integration_verification_command: ""
+    preserve_failed_days: 30
   run_timeout_seconds:
     main_turn: null
     delegate: 300
     plan: 600
+    replay: 300
+    worktree_integration: 300
     memory_nudge: 120
     skill_nudge: 180
     curator: 300
+
+reproducibility:
+  # 本地 bash 证据、快照和显式重放制品；不会自动回退或自动重放。
+  enabled: true
+  # 留空使用 ~/.minihermes/artifacts；非空时必须是本地绝对路径。
+  artifact_root: ""
+  max_log_bytes_per_stream: 20971520
+  max_snapshot_bytes: 209715200
+  retention_days: 30
+  max_total_artifact_bytes: 1073741824
+  keep_failed_days: 30

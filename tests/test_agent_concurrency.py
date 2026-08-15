@@ -172,7 +172,7 @@ def test_default_concurrency_remains_serial(tmp_path):
         db.close()
 
 
-@pytest.mark.parametrize("unsafe_tool", ["write_file", "web_search", "execute_code"])
+@pytest.mark.parametrize("unsafe_tool", ["web_search", "execute_code"])
 def test_unsafe_delegate_effective_tools_force_serial_fallback(tmp_path, unsafe_tool):
     db, runtime, provider, outcome, _ = _run_two_delegates(
         tmp_path, max_concurrency=2, tools=[unsafe_tool]
@@ -180,6 +180,30 @@ def test_unsafe_delegate_effective_tools_force_serial_fallback(tmp_path, unsafe_
     try:
         assert outcome.status == RunStatus.SUCCEEDED
         assert provider.max_active_children == 1
+    finally:
+        runtime.shutdown()
+        db.close()
+
+
+@pytest.mark.parametrize("write_tool", ["write_file", "bash"])
+def test_write_delegate_without_worktree_is_rejected_before_child_start(
+    tmp_path, write_tool
+):
+    db, runtime, provider, outcome, _ = _run_two_delegates(
+        tmp_path, max_concurrency=2, tools=[write_tool]
+    )
+    try:
+        assert outcome.status == RunStatus.SUCCEEDED
+        assert provider.max_active_children == 0
+        tool_messages = [
+            message for message in db.get_messages("session-1")
+            if message["role"] == "tool"
+        ]
+        assert len(tool_messages) == 2
+        assert all(
+            "require execution_mode=worktree_write" in message["content"]
+            for message in tool_messages
+        )
     finally:
         runtime.shutdown()
         db.close()

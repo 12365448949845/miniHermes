@@ -23,6 +23,14 @@ SLASH_COMMANDS: dict[str, str] = {
     "/sessions":  "List recent sessions",
     "/agents":    "List recent Agent runs",
     "/agent":     "Show one Agent run",
+    "/artifacts": "Show execution artifacts, retention, or cleanup",
+    "/recoveries": "List failure classifications for an Agent run",
+    "/recovery":  "Show one failure recovery audit record",
+    "/worktrees": "List isolated Worktree candidates",
+    "/worktree":  "Show one Worktree candidate",
+    "/integrate-worktree": "Verify and merge one Worktree candidate",
+    "/discard-worktree": "Permanently discard one Worktree candidate",
+    "/replay":    "Replay one recorded bash command in an isolated copy",
     "/cancel":    "Request cancellation of an Agent run",
     "/resume":    "Resume a previous session",
     "/title":     "Set title for current session",
@@ -152,6 +160,219 @@ def handle_slash_command(
             )
         return True, history, session_id, None
 
+    if command == "/recoveries":
+        if runtime is None:
+            print("[Agent Runtime is not available]")
+            return True, history, session_id, None
+        run_id = None
+        run_ref = arg.strip()
+        if run_ref:
+            run = runtime.get_run(run_ref)
+            if run is None:
+                matches = [
+                    item for item in runtime.list_runs(limit=200)
+                    if item["run_id"].startswith(run_ref)
+                ]
+                if len(matches) == 1:
+                    run = matches[0]
+                elif len(matches) > 1:
+                    print(f"[run id prefix is ambiguous: {run_ref}]")
+                    return True, history, session_id, None
+            if run is None:
+                print(f"[Agent run not found: {run_ref}]")
+                return True, history, session_id, None
+            run_id = run["run_id"]
+        elif conversation_id:
+            recent = runtime.list_runs(
+                conversation_id=conversation_id, limit=1
+            )
+            run_id = recent[0]["run_id"] if recent else None
+        records = runtime.list_recoveries(run_id=run_id, limit=50)
+        if not records:
+            suffix = f" for run {run_id}" if run_id else ""
+            print(f"[no recovery records found{suffix}]")
+            return True, history, session_id, None
+        print(f"{'RECOVERY ID':<32} {'CLASS':<18} {'ACTION':<16} STATUS")
+        print("─" * 92)
+        for record in records:
+            print(
+                f"{record['recovery_id']:<32} "
+                f"{record['failure_class']:<18} "
+                f"{record['selected_action']:<16} {record['status']}"
+            )
+        return True, history, session_id, None
+
+    if command == "/recovery":
+        if runtime is None:
+            print("[Agent Runtime is not available]")
+            return True, history, session_id, None
+        recovery_ref = arg.strip()
+        if not recovery_ref:
+            print("[usage: /recovery <recovery_id>]")
+            return True, history, session_id, None
+        record = runtime.get_recovery(recovery_ref)
+        if record is None:
+            matches = runtime.find_recoveries_by_prefix(recovery_ref, limit=3)
+            if len(matches) == 1:
+                record = matches[0]
+            elif len(matches) > 1:
+                print(f"[recovery id prefix is ambiguous: {recovery_ref}]")
+                return True, history, session_id, None
+        if record is None:
+            print(f"[recovery record not found: {recovery_ref}]")
+            return True, history, session_id, None
+        print(f"[Recovery {record['recovery_id']}]")
+        print(
+            f"run: {record['run_id']}  source: {record['source_kind']}  "
+            f"status: {record['status']}"
+        )
+        print(
+            f"failure: {record['failure_class']}/{record['error_code']}  "
+            f"decision: {record['selected_action']}"
+        )
+        if record.get("tool_execution_id"):
+            print(f"tool execution: {record['tool_execution_id']}")
+            evidence = runtime.get_execution_record_for_tool_execution(
+                record["tool_execution_id"]
+            )
+            if evidence:
+                print(
+                    f"source evidence: {evidence['record_id']}  "
+                    f"logs={evidence['log_status']}  "
+                    f"artifacts={evidence['artifact_status']}"
+                )
+            attempts = runtime.list_tool_retry_attempts(
+                record["tool_execution_id"]
+            )
+            for attempt in attempts:
+                wait = attempt.get("wait_status", "NOT_SCHEDULED")
+                delay = attempt.get("retry_delay_seconds")
+                wait_detail = wait
+                if delay is not None:
+                    wait_detail += f"({delay:.2f}s)"
+                detail = attempt["status"]
+                if attempt.get("error_code"):
+                    detail += f"/{attempt['error_code']}"
+                print(
+                    f"  attempt {attempt['attempt_number']}: {detail}  "
+                    f"retryable={attempt['retryable']} wait={wait_detail}"
+                )
+        if record.get("parent_recovery_id"):
+            print(f"parent recovery: {record['parent_recovery_id']}")
+        if record.get("result_record_id"):
+            print(f"result evidence: {record['result_record_id']}")
+        if record.get("workspace_id"):
+            print(f"workspace: {record['workspace_id']}")
+        print(
+            f"attempts: {record['attempt_number']}/{record['max_attempts']}  "
+            f"version: {record['version']}"
+        )
+        reason = record.get("reason") or {}
+        print(
+            "policy: "
+            f"audit_only={reason.get('audit_only', False)} "
+            f"registered_error={reason.get('registered_error', False)} "
+            f"retry_eligible={reason.get('retry_eligible', False)}"
+        )
+        return True, history, session_id, None
+
+    if command == "/worktrees":
+        if runtime is None:
+            print("[Agent Runtime is not available]")
+            return True, history, session_id, None
+        leases = runtime.list_worktrees(limit=50)
+        if not leases:
+            print("[no Worktree candidates found]")
+            return True, history, session_id, None
+        print(f"{'WORKSPACE ID':<32} {'STATUS':<13} {'CLEANUP':<10} SCOPE")
+        print("─" * 96)
+        for lease in leases:
+            scope = ", ".join(lease.get("write_scope") or ())[:35]
+            print(
+                f"{lease['workspace_id']:<32} {lease['lease_status']:<13} "
+                f"{lease['cleanup_status']:<10} {scope}"
+            )
+        return True, history, session_id, None
+
+    if command in {"/worktree", "/integrate-worktree", "/discard-worktree"}:
+        if runtime is None:
+            print("[Agent Runtime is not available]")
+            return True, history, session_id, None
+        workspace_ref = arg.strip()
+        if not workspace_ref:
+            print(f"[usage: {command} <workspace_id>]")
+            return True, history, session_id, None
+        lease = runtime.get_worktree(workspace_ref)
+        if lease is None:
+            matches = [
+                item for item in runtime.list_worktrees(limit=200)
+                if item["workspace_id"].startswith(workspace_ref)
+            ]
+            if len(matches) == 1:
+                lease = matches[0]
+            elif len(matches) > 1:
+                print(f"[workspace id prefix is ambiguous: {workspace_ref}]")
+                return True, history, session_id, None
+        if lease is None:
+            print(f"[Worktree candidate not found: {workspace_ref}]")
+            return True, history, session_id, None
+        try:
+            detail = runtime.inspect_worktree(lease["workspace_id"])
+        except Exception as exc:
+            print(f"[Worktree inspection failed: {exc}]")
+            return True, history, session_id, None
+        print(f"[Worktree {detail['workspace_id']}]")
+        print(
+            f"status: {detail['lease_status']}  cleanup: {detail['cleanup_status']}  "
+            f"run: {detail['run_id']}"
+        )
+        print(f"base: {detail['base_commit']}  branch: {detail['branch_name']}")
+        print(f"scope: {', '.join(detail.get('write_scope') or ())}")
+        changes = detail.get("current_changes") or []
+        print(f"changes: {len(changes)}")
+        for change in changes[:20]:
+            print(f"  {change['status']:<10} {change['path']}")
+        if len(changes) > 20:
+            print(f"  ... {len(changes) - 20} more")
+        for violation in detail.get("current_violations") or []:
+            print(f"violation: {violation}")
+        latest_integration = detail.get("latest_integration")
+        if latest_integration:
+            print(
+                "latest integration: "
+                f"{latest_integration['integration_id']} "
+                f"status={latest_integration['status']}"
+            )
+        if command == "/integrate-worktree":
+            print("[starting explicit verification and two-step approval]")
+            try:
+                integrated = runtime.integrate_worktree(detail["workspace_id"])
+                lease_result = integrated.get("lease") or {}
+                print(
+                    f"[Worktree integration {integrated.get('status', 'UNKNOWN')}: "
+                    f"{integrated.get('integration_id', detail['workspace_id'])}]"
+                )
+                if integrated.get("final_merge_commit"):
+                    print(f"merge commit: {integrated['final_merge_commit']}")
+                print(
+                    f"candidate: {lease_result.get('lease_status', 'UNKNOWN')}  "
+                    f"cleanup: {lease_result.get('cleanup_status', 'UNKNOWN')}"
+                )
+            except Exception as exc:
+                print(f"[Worktree integration failed to start: {exc}]")
+            return True, history, session_id, None
+        if command == "/discard-worktree":
+            print("[discarding this unmerged candidate permanently]")
+            try:
+                discarded = runtime.discard_worktree(detail["workspace_id"])
+                print(
+                    f"[Worktree discarded: {discarded['workspace_id']} "
+                    f"cleanup={discarded['cleanup_status']}]"
+                )
+            except Exception as exc:
+                print(f"[Worktree discard failed: {exc}]")
+        return True, history, session_id, None
+
     if command == "/agent":
         if runtime is None:
             print("[Agent Runtime is not available]")
@@ -203,8 +424,155 @@ def handle_slash_command(
                     detail += f"/{execution['error_code']}"
                 print(
                     f"  {execution['tool_name']}: {detail}  "
-                    f"attempts={execution['attempts']}"
+                    f"attempts={execution['attempts']} "
+                    f"execution={execution['execution_id']}"
                 )
+                for attempt in runtime.list_tool_retry_attempts(
+                    execution["execution_id"]
+                ):
+                    wait = attempt.get("wait_status", "NOT_SCHEDULED")
+                    delay = attempt.get("retry_delay_seconds")
+                    if delay is not None:
+                        wait += f"({delay:.2f}s)"
+                    attempt_detail = attempt["status"]
+                    if attempt.get("error_code"):
+                        attempt_detail += f"/{attempt['error_code']}"
+                    print(
+                        f"    #{attempt['attempt_number']} {attempt_detail} "
+                        f"retryable={attempt['retryable']} wait={wait}"
+                    )
+        records = runtime.list_execution_records(run["run_id"])
+        if records:
+            print("execution records:")
+            for record in records:
+                snapshot_detail = ""
+                if record.get("snapshot_id"):
+                    snapshot = runtime.get_workspace_snapshot(record["snapshot_id"])
+                    snapshot_status = (
+                        snapshot.get("artifact_status", "AVAILABLE")
+                        if snapshot else "MISSING"
+                    )
+                    snapshot_detail = (
+                        f" snapshot={record['snapshot_id']}({snapshot_status})"
+                    )
+                print(
+                    f"  {record['record_id']}: {record['reproducibility_status']} "
+                    f"artifact={record['artifact_status']} replay={record['replay_status']}"
+                    f"{snapshot_detail}"
+                )
+        return True, history, session_id, None
+
+    if command == "/artifacts":
+        if runtime is None:
+            print("[Agent Runtime is not available]")
+            return True, history, session_id, None
+        run_ref = arg.strip()
+        if run_ref in {"retention", "cleanup"}:
+            try:
+                if run_ref == "retention":
+                    summary = runtime.inspect_execution_artifact_retention()
+                    reasons = summary.get("blocked_reasons", {})
+                    reason_text = ", ".join(
+                        f"{name}={count}" for name, count in sorted(reasons.items())
+                    ) or "none"
+                    print(
+                        "[artifact retention: "
+                        f"groups={summary['groups']} eligible={summary['eligible_groups']} "
+                        f"blocked={summary['blocked_groups']} "
+                        f"already_purged={summary['already_purged_groups']} "
+                        f"reasons={reason_text}]"
+                    )
+                else:
+                    summary = runtime.cleanup_execution_artifacts()
+                    errors = summary.get("errors", [])
+                    error_text = ", ".join(errors[:3]) if errors else "none"
+                    print(
+                        "[artifact cleanup: "
+                        f"purged_groups={summary['purged_groups']}/"
+                        f"{summary['claimed_groups']} "
+                        f"records={summary['purged_records']} "
+                        f"orphan_bundles={summary.get('orphan_bundles', 0)} "
+                        f"deleted_bytes={summary['deleted_bytes']} "
+                        f"remaining_bytes={summary['remaining_bytes']} "
+                        f"errors={error_text}]"
+                    )
+            except Exception as exc:
+                print(f"[artifact retention unavailable: {exc}]")
+            return True, history, session_id, None
+        if not run_ref:
+            print("[usage: /artifacts <run_id> | retention | cleanup]")
+            return True, history, session_id, None
+        run = runtime.get_run(run_ref)
+        if run is None:
+            matches = [item for item in runtime.list_runs(limit=200) if item["run_id"].startswith(run_ref)]
+            if len(matches) == 1:
+                run = matches[0]
+            elif len(matches) > 1:
+                print(f"[run id prefix is ambiguous: {run_ref}]")
+                return True, history, session_id, None
+        if run is None:
+            print(f"[Agent run not found: {run_ref}]")
+            return True, history, session_id, None
+        records = runtime.list_execution_records(run["run_id"])
+        if not records:
+            print("[no execution artifacts for this run]")
+            return True, history, session_id, None
+        print(f"[execution artifacts for {run['run_id']}]")
+        snapshots = runtime.list_workspace_snapshots(run["run_id"])
+        if snapshots:
+            print("snapshots:")
+            for snapshot in snapshots:
+                print(
+                    f"  {snapshot['snapshot_id']}  "
+                    f"capture={snapshot['capture_status']} "
+                    f"artifact={snapshot.get('artifact_status', 'AVAILABLE')}"
+                )
+        for record in records:
+            snapshot_detail = ""
+            if record.get("snapshot_id"):
+                snapshot = runtime.get_workspace_snapshot(record["snapshot_id"])
+                snapshot_status = (
+                    snapshot.get("artifact_status", "AVAILABLE")
+                    if snapshot else "MISSING"
+                )
+                snapshot_detail = f" snapshot={record['snapshot_id']}({snapshot_status})"
+            print(
+                f"{record['record_id']}  {record['tool_name']}  "
+                f"{record['reproducibility_status']}  artifact={record['artifact_status']}  "
+                f"replay={record['replay_status']}{snapshot_detail}"
+            )
+        return True, history, session_id, None
+
+    if command == "/replay":
+        if runtime is None:
+            print("[Agent Runtime is not available]")
+            return True, history, session_id, None
+        record_ref = arg.strip()
+        if not record_ref:
+            print("[usage: /replay <record_id>]")
+            return True, history, session_id, None
+        record = runtime.get_execution_record(record_ref)
+        if record is None:
+            matches = runtime.find_execution_records_by_prefix(record_ref)
+            if len(matches) == 1:
+                record = matches[0]
+            elif len(matches) > 1:
+                print(f"[execution record id prefix is ambiguous: {record_ref}]")
+                return True, history, session_id, None
+        if record is None:
+            print(f"[execution record not found: {record_ref}]")
+            return True, history, session_id, None
+        try:
+            outcome = runtime.replay_execution(
+                record["record_id"], conversation_id=conversation_id
+            )
+        except Exception as exc:
+            print(f"[replay unavailable: {exc}]")
+            return True, history, session_id, None
+        print(
+            f"[replay {outcome.status.value.lower()}: run={outcome.run_id} "
+            f"reason={outcome.completion_reason}]"
+        )
         return True, history, session_id, None
 
     if command == "/cancel":
@@ -287,6 +655,16 @@ def handle_slash_command(
             "/sessions    — list recent sessions\n"
             "/agents      — list recent Agent runs\n"
             "/agent <id>  — show one Agent run\n"
+            "/artifacts <run_id> — show recorded command artifacts\n"
+            "/artifacts retention — show protected/expired artifact groups\n"
+            "/artifacts cleanup — purge only expired, unprotected artifacts\n"
+            "/recoveries [run_id] — list failure classifications and decisions\n"
+            "/recovery <id> — show one recovery audit record\n"
+            "/worktrees    — list isolated write candidates\n"
+            "/worktree <id> — inspect one candidate and its changed files\n"
+            "/integrate-worktree <id> — verify and merge one candidate locally\n"
+            "/discard-worktree <id> — permanently remove an unmerged candidate\n"
+            "/replay <record_id> — replay one recorded bash command\n"
             "/resume [id] — resume a previous session\n"
             "/title <name>— name the current session\n"
             "/sysprompt   — print current system prompt (debug)\n"

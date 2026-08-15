@@ -13,6 +13,7 @@ API 文档：https://docs.exa.ai/reference/search
 import json
 
 from tools import register
+from tools.retry import trusted_tool_failure
 import config as cfg
 
 _search_cfg = cfg.get_search_config()
@@ -94,32 +95,62 @@ def web_search(query: str, count: int = _DEFAULT_COUNT) -> str:
         )
     except ValueError:
         # API Key 未配置
-        return (
+        return trusted_tool_failure(
             "Error: Exa API key not configured. "
             "Set search.api_key in config.yaml. "
-            "Get your free API key (1,000 requests/month) at https://dashboard.exa.ai"
+            "Get your free API key (1,000 requests/month) at https://dashboard.exa.ai",
+            "missing_configuration",
         )
     except Exception as e:
         error_msg = str(e)
+        response = getattr(e, "response", None)
+        status_code = getattr(response, "status_code", None)
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+        lowered = error_msg.lower()
         # 识别常见错误
-        if "401" in error_msg or "unauthorized" in error_msg.lower():
-            return (
+        if status_code == 401 or "401" in error_msg or "unauthorized" in lowered:
+            return trusted_tool_failure(
                 "Error: Exa API key is invalid. "
                 "Check search.api_key in config.yaml. "
-                "Get a valid key at https://dashboard.exa.ai"
+                "Get a valid key at https://dashboard.exa.ai",
+                "authentication_failed",
             )
-        if "402" in error_msg or "quota" in error_msg.lower() or "limit" in error_msg.lower():
-            return (
+        if status_code == 403 or "403" in error_msg or "forbidden" in lowered:
+            return trusted_tool_failure(
+                "Error: Exa API permission denied. Check the API key permissions.",
+                "permission_denied",
+            )
+        if status_code == 402 or "402" in error_msg or "quota" in lowered:
+            return trusted_tool_failure(
                 "Error: Exa API quota exceeded. "
                 "Upgrade your plan at https://exa.ai/pricing "
-                "or wait for your monthly quota to reset."
+                "or wait for your monthly quota to reset.",
+                "quota_exceeded",
             )
-        if "429" in error_msg or "rate" in error_msg.lower():
-            return (
+        if status_code == 429 or "429" in error_msg or "rate limit" in lowered:
+            return trusted_tool_failure(
                 "Error: Exa API rate limit hit. "
-                "Please wait a moment and try again."
+                "Please wait a moment and try again.",
+                "rate_limited",
+                retryable=True,
+                retry_after=retry_after,
             )
-        return f"Error: Exa search failed: {error_msg}"
+        transient = (
+            isinstance(status_code, int) and status_code >= 500
+        ) or any(
+            marker in lowered
+            for marker in (
+                "timeout", "timed out", "connection", "connection reset",
+                "temporarily unavailable",
+            )
+        )
+        return trusted_tool_failure(
+            f"Error: Exa search failed: {error_msg}",
+            "network_transient" if transient else "permanent_failure",
+            retryable=transient,
+            retry_after=retry_after if transient else None,
+        )
 
     return _parse_results(response, query)
 

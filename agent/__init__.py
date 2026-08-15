@@ -1,5 +1,94 @@
 """Agent 编排层：对话循环与子 Agent 委派。"""
 from .agent import Agent, ConversationResult
 from context.context import IterationBudget
+from .reproducibility import (
+    ArtifactCleanupError,
+    ArtifactRetentionManager,
+    ArtifactStore,
+    ExecutionEvidenceRecorder,
+)
+from .graph import (
+    EdgeDefinition,
+    EdgeRule,
+    GraphDefinitionError,
+    GraphDefinitionRegistry,
+    GraphStateError,
+    NodeDefinition,
+    NodeKind,
+    NodeResult,
+    ParallelClass,
+    RetryPolicy,
+    WorkflowDefinition,
+)
+from .graph_runner import GraphRunner, MainTurnGraphContext
+from .worktree import (
+    GitGateFailure,
+    GitWorkspaceInspection,
+    CandidateAudit,
+    IntegrationWorkspace,
+    WorkspaceExecutionContext,
+    WorkspaceIntegrationError,
+    WorkspaceManager,
+    WorkspaceOperationError,
+    WorkspaceValidationError,
+)
+from .workspace_runner import (
+    DockerWorkspaceCommandRunner,
+    RunnerProbe,
+    WorkspaceCommandResult,
+    WorkspaceRunnerError,
+)
+from .recovery import (
+    ERROR_CODE_REGISTRY,
+    FailureClass,
+    RecoveryAction,
+    RecoveryController,
+    RecoveryDecision,
+    RecoveryPolicy,
+    ToolFailure,
+    classify_tool_failure,
+)
 
-__all__ = ["Agent", "IterationBudget", "ConversationResult"]
+__all__ = [
+    "Agent",
+    "IterationBudget",
+    "ConversationResult",
+    "ArtifactRetentionManager",
+    "ArtifactStore",
+    "ArtifactCleanupError",
+    "ExecutionEvidenceRecorder",
+    "EdgeDefinition",
+    "EdgeRule",
+    "GraphDefinitionError",
+    "GraphDefinitionRegistry",
+    "GraphStateError",
+    "NodeDefinition",
+    "NodeKind",
+    "NodeResult",
+    "ParallelClass",
+    "RetryPolicy",
+    "WorkflowDefinition",
+    "GraphRunner",
+    "MainTurnGraphContext",
+    "GitGateFailure",
+    "GitWorkspaceInspection",
+    "CandidateAudit",
+    "IntegrationWorkspace",
+    "WorkspaceExecutionContext",
+    "WorkspaceIntegrationError",
+    "WorkspaceManager",
+    "WorkspaceOperationError",
+    "WorkspaceValidationError",
+    "DockerWorkspaceCommandRunner",
+    "RunnerProbe",
+    "WorkspaceCommandResult",
+    "WorkspaceRunnerError",
+    "ERROR_CODE_REGISTRY",
+    "FailureClass",
+    "RecoveryAction",
+    "RecoveryController",
+    "RecoveryDecision",
+    "RecoveryPolicy",
+    "ToolFailure",
+    "classify_tool_failure",
+]

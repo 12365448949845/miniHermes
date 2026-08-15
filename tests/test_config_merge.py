@@ -17,6 +17,11 @@ def test_injected_config_path_recursively_fills_defaults_without_overwriting(tmp
             "cancel_grace_seconds": 7,
             "run_timeout_seconds": {"delegate": 42},
         },
+        "reproducibility": {
+            "enabled": False,
+            "artifact_root": "C:/user-artifacts",
+            "retention_days": 14,
+        },
         "custom": {"items": ["keep", "this"]},
     }
     path.write_text(yaml.safe_dump(original, sort_keys=False), encoding="utf-8")
@@ -31,7 +36,45 @@ def test_injected_config_path_recursively_fills_defaults_without_overwriting(tmp
     assert config.agent_runtime["cancel_grace_seconds"] == 7.0
     assert config.agent_runtime["run_timeout_seconds"]["delegate"] == 42.0
     assert config.agent_runtime["run_timeout_seconds"]["plan"] == 600.0
+    assert config.agent_runtime["run_timeout_seconds"]["worktree_integration"] == 300.0
+    assert config.agent_runtime["worktree"] == {
+        "enabled": False,
+        "max_write_concurrency": 1,
+        "runner": "docker",
+        "docker_image": "",
+        "docker_user": "65532:65532",
+        "pids_limit": 256,
+        "memory_limit": "1g",
+        "integration_verification_command": "",
+        "preserve_failed_days": 30,
+    }
+    assert config.reproducibility["enabled"] is False
+    assert config.reproducibility["artifact_root"] == "C:/user-artifacts"
+    assert config.reproducibility["retention_days"] == 14
+    assert config.reproducibility["max_log_bytes_per_stream"] == 20 * 1024 * 1024
     assert config._data["custom"]["items"] == ["keep", "this"]
 
     # 指定路径用于测试/注入时只在内存中补默认值，不能擅自改写文件。
     assert yaml.safe_load(path.read_text(encoding="utf-8")) == original
+
+
+def test_worktree_write_concurrency_is_clamped_to_w3_limit(tmp_path):
+    path = tmp_path / "config.yaml"
+
+    path.write_text(
+        yaml.safe_dump({"agent_runtime": {"worktree": {"max_write_concurrency": 9}}}),
+        encoding="utf-8",
+    )
+    assert Config(config_path=path).agent_runtime["worktree"]["max_write_concurrency"] == 2
+
+    path.write_text(
+        yaml.safe_dump({"agent_runtime": {"worktree": {"max_write_concurrency": 0}}}),
+        encoding="utf-8",
+    )
+    assert Config(config_path=path).agent_runtime["worktree"]["max_write_concurrency"] == 1
+
+    path.write_text(
+        yaml.safe_dump({"agent_runtime": {"worktree": {"max_write_concurrency": "bad"}}}),
+        encoding="utf-8",
+    )
+    assert Config(config_path=path).agent_runtime["worktree"]["max_write_concurrency"] == 1

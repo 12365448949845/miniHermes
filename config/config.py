@@ -128,6 +128,12 @@ class Config:
         self._ensure_loaded()
         return _normalize_agent_runtime(self._data.get("agent_runtime", {}))
 
+    @property
+    def reproducibility(self) -> dict:
+        """本地执行证据和制品保留配置。"""
+        self._ensure_loaded()
+        return _normalize_reproducibility(self._data.get("reproducibility", {}))
+
     def reload(self):
         """强制从磁盘重新加载（运行时配置变更后调用）。"""
         self._data = None
@@ -163,10 +169,24 @@ def _normalize_agent_runtime(raw: dict | None) -> dict:
         # Delegate 并发必须显式开启；1 保持现有的严格串行行为。
         "max_concurrency": 1,
         "delegate_batch_timeout_seconds": 300.0,
+        "worktree": {
+            "enabled": False,
+            # W3 只允许显式从默认 1 放开到 2。
+            "max_write_concurrency": 1,
+            "runner": "docker",
+            "docker_image": "",
+            "docker_user": "65532:65532",
+            "pids_limit": 256,
+            "memory_limit": "1g",
+            "integration_verification_command": "",
+            "preserve_failed_days": 30,
+        },
         "run_timeout_seconds": {
             "main_turn": None,
             "delegate": 300.0,
             "plan": 600.0,
+            "replay": 300.0,
+            "worktree_integration": 300.0,
             "memory_nudge": 120.0,
             "skill_nudge": 180.0,
             "curator": 300.0,
@@ -189,6 +209,37 @@ def _normalize_agent_runtime(raw: dict | None) -> dict:
         value["delegate_batch_timeout_seconds"] = min(max(timeout, 1.0), 3600.0)
     except (TypeError, ValueError):
         value["delegate_batch_timeout_seconds"] = 300.0
+    worktree = value.get("worktree")
+    if not isinstance(worktree, dict):
+        worktree = copy.deepcopy(defaults["worktree"])
+        value["worktree"] = worktree
+    worktree["enabled"] = bool(worktree.get("enabled", False))
+    try:
+        worktree["max_write_concurrency"] = min(
+            max(int(worktree.get("max_write_concurrency", 1)), 1), 2
+        )
+    except (TypeError, ValueError):
+        worktree["max_write_concurrency"] = 1
+    worktree["runner"] = (
+        worktree.get("runner", "docker").strip().lower()
+        if isinstance(worktree.get("runner", "docker"), str)
+        else "docker"
+    )
+    for key in ("docker_image", "docker_user", "memory_limit", "integration_verification_command"):
+        raw_value = worktree.get(key, defaults["worktree"][key])
+        worktree[key] = raw_value.strip() if isinstance(raw_value, str) else defaults["worktree"][key]
+    try:
+        worktree["pids_limit"] = min(
+            max(int(worktree.get("pids_limit", 256)), 16), 4096
+        )
+    except (TypeError, ValueError):
+        worktree["pids_limit"] = 256
+    try:
+        worktree["preserve_failed_days"] = min(
+            max(int(worktree.get("preserve_failed_days", 30)), 1), 3650
+        )
+    except (TypeError, ValueError):
+        worktree["preserve_failed_days"] = 30
     for kind, timeout in value.get("run_timeout_seconds", {}).items():
         if timeout is None:
             continue
@@ -200,5 +251,40 @@ def _normalize_agent_runtime(raw: dict | None) -> dict:
     return value
 
 
+def _normalize_reproducibility(raw: dict | None) -> dict:
+    defaults = {
+        "enabled": True,
+        "artifact_root": "",
+        "max_log_bytes_per_stream": 20 * 1024 * 1024,
+        "max_snapshot_bytes": 200 * 1024 * 1024,
+        "retention_days": 30,
+        "max_total_artifact_bytes": 1024 * 1024 * 1024,
+        "keep_failed_days": 30,
+    }
+    value = _fill_missing(defaults, raw if isinstance(raw, dict) else {})
+    value["enabled"] = bool(value.get("enabled", True))
+    artifact_root = value.get("artifact_root", "")
+    value["artifact_root"] = artifact_root.strip() if isinstance(artifact_root, str) else ""
+    for key, default, minimum, maximum in (
+        ("max_log_bytes_per_stream", defaults["max_log_bytes_per_stream"], 1024, 1024 * 1024 * 1024),
+        ("max_snapshot_bytes", defaults["max_snapshot_bytes"], 1024, 10 * 1024 * 1024 * 1024),
+        ("max_total_artifact_bytes", defaults["max_total_artifact_bytes"], 1024, 100 * 1024 * 1024 * 1024),
+    ):
+        try:
+            value[key] = min(max(int(value.get(key, default)), minimum), maximum)
+        except (TypeError, ValueError):
+            value[key] = default
+    for key, default in (("retention_days", 30), ("keep_failed_days", 30)):
+        try:
+            value[key] = min(max(int(value.get(key, default)), 1), 3650)
+        except (TypeError, ValueError):
+            value[key] = default
+    return value
+
+
 def get_agent_runtime_config() -> dict:
     return _default_config.agent_runtime
+
+
+def get_reproducibility_config() -> dict:
+    return _default_config.reproducibility
